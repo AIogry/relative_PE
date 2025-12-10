@@ -412,6 +412,11 @@ class ModelConfig(BaseConfig):
     The theta setting for RoPE.
     """
 
+    uniform_frequency: bool = False
+    """
+    get uniform theta
+    """
+
     sin_lambda: float = 50.0
     """
     for scaling sin term into exponential 

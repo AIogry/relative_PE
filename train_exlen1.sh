@@ -100,13 +100,31 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 
 # 2025-12-9 测试理想的全cos求和的attention
+# /home/qijunrong/anaconda3/bin/python train_exlen.py \
+#    --config ./configs/olmo_60m.yaml \
+#    --run_name "olmo-60m-diag-singlegpu-100w" \
+#    --use_diag_pe \
+#    --train_max_sequence_length 512 \
+#    --val_max_sequence_length 512 \
+#    --train_size 1000000 \
+#    --val_size 10000 \
+#    --batch_size 8 \
+#    --micro_batch_size 4 \
+#    --max_steps 60000 \
+#    --eval_interval 1000\
+#    --save_interval 10000 \
+#    --log_interval 200 \
+#    --seed 6198
+
+
 /home/qijunrong/anaconda3/bin/python train_exlen.py \
     --config ./configs/olmo_60m.yaml \
-    --run_name "olmo-60m-diag-singlegpu-100w" \
-    --use_diag_pe \
+    --run_name "olmo-60m-uniformRoPE-singlegpu-50w" \
+    --uniform_frequency \
+    --position_embedding rope \
     --train_max_sequence_length 512 \
     --val_max_sequence_length 512 \
-    --train_size 1000000 \
+    --train_size 500000 \
     --val_size 10000 \
     --batch_size 8 \
     --micro_batch_size 4 \

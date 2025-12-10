@@ -230,6 +230,8 @@ def main():
 
     # --- Arguments to override config file settings ---
     parser.add_argument("--position_embedding", type=str, choices=['rope', 'fope', 'grid'], default="rope", help="Override the position embedding method.")
+    parser.add_argument("--uniform_frequency", action="store_true", help="The frequency is uniform")
+    
     parser.add_argument("--use_scaled_rope2", action="store_true", help="Enable two weights Scaled RoPE.")
     parser.add_argument("--sin_lambda", type=float, default=None, help="Lambda for sin scaling in Scaled RoPE.")
     parser.add_argument("--cos_sigma", type=float, default=None, help="Sigma for cos scaling in Scaled RoPE.")
@@ -302,6 +304,9 @@ def main():
 
     # evaluate length extension
     cfg.val_max_sequence_length = args.val_max_sequence_length if args.val_max_sequence_length is not None else args.train_max_sequence_length
+
+    if args.uniform_frequency:
+        cfg.model.uniform_frequency = True
 
     if args.use_diag_pe:
         cfg.model.use_diag_pe = True

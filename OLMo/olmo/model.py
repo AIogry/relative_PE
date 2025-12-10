@@ -279,8 +279,15 @@ class RotaryEmbedding(nn.Module):
     def get_inv_freq(self, device: torch.device):
         dim = self.config.d_model // self.config.n_heads
         i = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
 
+        L = self.config.max_sequence_length      # for uniform sampling frequency
+        # uniform sampling frequency
+        if self.config.uniform_frequency:
+            inv_freq = 2.0 * torch.pi * i / (L)  # * dim)
+        else:
+            inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
+
+        # for fope
         if self.config.fope and not self.config.use_place_cells:
             inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
 
@@ -362,8 +369,7 @@ class RotaryEmbedding(nn.Module):
             self._cache["rope_pos_sin"] = pos_sin
             self._cache["rope_pos_cos"] = pos_cos
 
-        return pos_sin, pos_cos    
-
+        return pos_sin, pos_cos
     
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         
@@ -397,6 +403,9 @@ class RotaryEmbedding(nn.Module):
             )
             k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
         return q_.type_as(q), k_.type_as(k)
+
+
+
 
 class GridEmbedding(RotaryEmbedding):
     def __init__(self, config: ModelConfig, cache: BufferCache, sigma):
