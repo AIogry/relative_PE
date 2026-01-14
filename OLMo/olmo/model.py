@@ -1298,7 +1298,9 @@ class OLMoBlock(nn.Module):
 
                 self.flash_attn_func = flash_attn_func
                 self.flash_attn_varlen_func = flash_attn_varlen_func
+                print(">>> SUCCESS: Flash Attention library loaded successfully!")
             except ModuleNotFoundError:
+                print(">>> WARNING: config.flash_attention=True but 'flash-attn' library not found! Falling back to slow attention.")
                 pass
 
     def reset_parameters(self):

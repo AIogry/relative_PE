@@ -6,7 +6,7 @@ modfiy based on train.py
 add train_max_sequence_length / val_max_sequence_length
 add eval_interval, change save_interval to only save model in the finishing time
 
-2026-1-14: add flashattention
+2026-1-14: add flashattention, autocast
 """
 import torch
 import torch.nn.functional as F
@@ -141,15 +141,15 @@ def run_experiment(cfg: TrainConfig, max_steps: int, log_interval: int, eval_int
         input_ids = batch["input_ids"].to(device)
         
         optimizer.zero_grad()
-        outputs = model(input_ids=input_ids)
-        logits = outputs.logits[:, :-1, :].contiguous()
-        labels = input_ids[:, 1:].contiguous()
-        
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=cfg.model.pad_token_id)
+        with autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits[:, :-1, :].contiguous()
+            labels = input_ids[:, 1:].contiguous()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=cfg.model.pad_token_id)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        optimizer.step()
-        
+        optimizer.step()    # update parameter every micro batch !!!
+
         current_lr = scheduler.get_lr(cfg.optimizer.learning_rate, step, max_steps)
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
@@ -206,9 +206,10 @@ def evaluate_model(model, eval_loader, cfg, device, max_eval_steps):
         for step, batch in enumerate(islice(eval_loader, max_eval_steps)):
             input_ids = batch["input_ids"].to(device)
             labels = input_ids[:, 1:].contiguous()
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=cfg.model.pad_token_id, reduction='sum')
+            with autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(input_ids=input_ids)
+                logits = outputs.logits[:, :-1, :].contiguous()
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=cfg.model.pad_token_id, reduction='sum')
             total_loss += loss.item()
             total_tokens += (labels != cfg.model.pad_token_id).sum().item()
     

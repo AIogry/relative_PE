@@ -12,6 +12,8 @@ model:
   vocab_size: 50304         # From the full OLMo-60M config
   init_device: "cuda"
 
+  # flashattention
+  flash_attention: true
   # --- Positional Embedding Settings ---
   # To run the RoPE baseline, use these settings:
   rope: true

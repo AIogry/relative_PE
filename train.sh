@@ -122,27 +122,24 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 # test exp, sigma = 85.0, len = 2048, every 1000step
 # ================= 配置区域 =================
-# 实验名称关键参数
+
 SIGMA=85.0
 DECAY_FUNC="exp"
 SEQ_LEN=2048
 
-# 优化参数 (针对 RTX 5090 单卡)
-# Global Batch Size: 128 (增大BS以稳定梯度，解决PPL卡在70的问题)
+# single RTX 5090
+# Global Batch Size: 128
 GLOBAL_BS=128
-# Micro Batch Size: 64 (压榨5090显存，加速训练)
-# 如果报OOM (显存不足)，请将 MICRO_BS 降为 32，但保持 GLOBAL_BS 为 128 不变
-MICRO_BS=4
+# Micro Batch Size: 8
+MICRO_BS=8
 
-# 数据量控制
-# 目标: 训练约 10亿 (1B) Tokens (与之前的 TRAIN_SIZE=500000 保持一致)
-# 计算: 1B / (128 * 2048) ≈ 3800 步 -> 取整 4000 步
-MAX_STEPS=60000
-TRAIN_SIZE=5000000 # 保持这个数值，确保数据加载器有足够的数据去跑完 4000 步
+# debug
+MAX_STEPS=40000
+TRAIN_SIZE=5000000
+# TRAIN_SIZE=5000000
 
-# ===========================================
-
-run_name="olmo-60m-ScaledRoPE-${DECAY_FUNC}-s${SIGMA}-len${SEQ_LEN}-1B_tokens-BS${GLOBAL_BS}"
+# run_name="olmo-60m-ScaledRoPE-${DECAY_FUNC}-s${SIGMA}-len${SEQ_LEN}-1B_tokens-BS${GLOBAL_BS}"
+run_name="olmo-60m-ScaledRoPE-flash-len2048-1B"
 
 echo "===================================================================="
 echo "Starting run: $run_name"
@@ -166,6 +163,7 @@ echo "===================================================================="
     --max_steps $MAX_STEPS \
     --save_interval 5000 \
     --log_interval 200 \
+    --eval_interval 1000 \
     --seed 6198
 
 echo "Finished run: $run_name"
