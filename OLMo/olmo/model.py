@@ -656,15 +656,32 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
             # Resulting `scale` has shape (n_heads, dim / 2)
             #print(inv_freq)
             if hasattr(self.config, 'decay_func'):
+                freqs = inv_freq.view(1, -1) # theta
+
                 if self.config.decay_func == 'gaussian':
-                    scale = torch.exp(-sigmas_tensor**2 * inv_freq.view(1, -1)**2/2)*inv_freq.view(1, -1)
+                    scale = torch.exp(-sigmas_tensor**2 * freqs**2/2)*freqs
                 elif self.config.decay_func == 'exp':
                     #print('using exponential decay function')
-                    scale = (1/sigmas_tensor)**2/((1/sigmas_tensor)**2+inv_freq.view(1, -1)**2)*inv_freq.view(1, -1)
+                    scale = (1/sigmas_tensor)**2/((1/sigmas_tensor)**2+freqs**2)*freqs
                 elif self.config.decay_func == 'power':
-                    scale = torch.exp(-sigmas_tensor*inv_freq.view(1, -1))*inv_freq.view(1, -1)
+                    scale = torch.exp(-sigmas_tensor*freqs)*freqs
+                elif self.config.decay_func == 'segmented':
+                    # Butterworth filter
+                    # 【New】Segmented Frequency Scaling (Butterworth Style)
+                    # Flat-top decay, lowpass filtering
+                    # when theta < 1/sigma, scale approx 1
+                    # when theta > 1/sigma, scale decay steeply
+                    # decay_order (k) control the steepness of the descent
+                    
+                    order = getattr(self.config, 'decay_order', 8) # default = 8, it produces a distinct "segmentation" effect.
+                    
+                    # 核心公式: 1 / (1 + (sigma * theta)^k)
+                    filter_profile = 1.0 / (1.0 + (sigmas_tensor * freqs) ** order)
+                    
+                    # 应用滤波器并保留原始频率密度项 (freqs)
+                    scale = filter_profile * freqs
             else:
-                scale = torch.exp(-sigmas_tensor**2 * inv_freq.view(1, -1)**2/2)*inv_freq.view(1, -1)
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2)*freqs
             #print(scale)
             scale = torch.sqrt(scale)
             # In standard RoPE, the head dimension is composed of pairs of sin/cos
@@ -1083,6 +1100,9 @@ class DiagonalPositionEncoding(nn.Module):
         # (seq_len_q, seq_len_k, dim)
         cos_mod = torch.cos(pos_diff * theta)
         return cos_mod.to(dtype=dtype)
+
+
+
 
 class Activation(nn.Module):
     def __init__(self, config: ModelConfig):

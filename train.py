@@ -5,6 +5,8 @@ add train_size / val_size / max_sequence_length varibale
 modfiy based on train.py
 add train_max_sequence_length / val_max_sequence_length
 add eval_interval, change save_interval to only save model in the finishing time
+
+2026-1-14: add flashattention
 """
 import torch
 import torch.nn.functional as F
@@ -17,6 +19,7 @@ import json
 from datetime import datetime
 import random
 import numpy as np
+from torch.amp import autocast
 
 # Import necessary components from OLMo and Hugging Face datasets
 from OLMo.olmo.config import TrainConfig
@@ -238,8 +241,10 @@ def main():
     parser.add_argument("--use_scaled_rope1", action="store_true", help="Enable one weight Scaled RoPE.")
     parser.add_argument("--scaled_rope_sigma",type=float,default=None,help = "Place field size for scaledRoPE")
     parser.add_argument("--sigmas", nargs='+', type=float, default=None, help="List of sigma values to scan.")
-    parser.add_argument("--decay_func", type=str, choices=['exp', 'gaussian','power'], default=None, help="Distance decay function for scaledRoPE")
+    parser.add_argument("--decay_func", type=str, choices=['exp', 'gaussian','power', 'segmented'], default=None, help="Distance decay function for scaledRoPE")
+    parser.add_argument("--decay_order", type=float, default=None, help="Order for segmented (Butterworth) decay function.")
 
+    
     parser.add_argument("--yarn_enabled", action="store_true", help="Enable YaRN for context window extension.")
     parser.add_argument("--yarn_max_position_embeddings", type=int, default=4096, help="Original training context length (L_base).")
     parser.add_argument("--yarn_target_max_position_embeddings", type=int, default=None, help="Target context length for fine-tuning (L_target). If not set, inferred from max_sequence_length.")
@@ -326,6 +331,8 @@ def main():
                 cfg.model.scaled_rope_sigma = args.scaled_rope_sigma
             if args.decay_func is not None:
                 cfg.model.decay_func = args.decay_func
+                if args.decay_func == 'segmented':
+                    cfg.model.decay_order = args.decay_order
         else:
             cfg.model.use_scaled_rope1 = False
             cfg.model.use_scaled_rope2=False

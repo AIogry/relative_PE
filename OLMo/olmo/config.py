@@ -314,6 +314,10 @@ class ModelConfig(BaseConfig):
     """
     use_place_cells: bool = False
 
+    decay_order: float = 8.0
+    """
+    The order of Butterworth filter
+    """
 
     use_diag_pe: bool =False
     """

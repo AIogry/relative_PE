@@ -1,0 +1,45 @@
+# 适配版 300M 配置 (Compatible with your simplified train.py)
+run_name: "olmo-300m"
+
+model:
+  # === 300M 模型核心参数 (参考官方配置调整) ===
+  d_model: 1024
+  n_heads: 16
+  n_layers: 24             # 官方可能是 16 层 + mlp_ratio=8，这里我们用更通用的 24 层结构
+  mlp_hidden_size: 4096    # d_model * 4 (标准 Transformer 设置)
+  
+  # === 通用设置 (复制自 60M 配置并适配) ===
+  max_sequence_length: 2048
+  vocab_size: 50304        # 保持与分词器一致
+  embedding_size: 50304
+  eos_token_id: 50256
+  pad_token_id: 50256
+  init_device: "cuda"
+  init_fn: "normal"
+  weight_tying: false
+  attention_dropout: 0.0
+  attention_layer_norm: false
+  include_bias: false
+  block_type: "sequential"
+  activation_type: "swiglu"
+  
+  # === 关键性能开关 ===
+  flash_attention: true    # 【必须开启】否则 300M 会爆显存
+  rope: true               # 启用 RoPE
+
+optimizer:
+  name: adamw
+  learning_rate: 3.0e-4    # 300M 模型建议用 3e-4 或 4e-4 (比 60M 小)
+  weight_decay: 0.1
+  betas:
+  - 0.9
+  - 0.95
+
+scheduler:
+  name: cosine_with_warmup
+  t_warmup: 200            # 预热步数
+  alpha_f: 0.1
+
+# --- Batching (会被命令行参数覆盖，但这里留个默认值) ---
+global_train_batch_size: 128
+device_train_microbatch_size: 32
