@@ -21,14 +21,14 @@ GLOBAL_BS=128
 MICRO_BS=8
 
 # 2. 保持一致的数据量
-TRAIN_SIZE=5000000
+TRAIN_SIZE=6000000
 SEQ_LEN=2048
 
 # 3. 步数计算 (重要修正)
 # 5,000,000 / 128 = 39,062.5
 # 为了防止跑到 40000 步时报 "IndexError/StopIteration" (数据耗尽)，
 # 我们这里设置为 39100，这足以跑完一轮数据。
-MAX_STEPS=40000
+MAX_STEPS=6000
 
 run_name="olmo-60m-Baseline-RoPE-flash-len2048-1B"
 
