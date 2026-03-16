@@ -551,9 +551,101 @@ class GridEmbedding(RotaryEmbedding):
             )
             k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
         return q_.type_as(q), k_.type_as(k)
+    
 
 
 class ScaledRotaryEmbedding(RotaryEmbedding):
+    """
+    Scaled RoPE with Optional Layer-wise Control.
+    Modes:
+    1. Uniform Scaling: All layers use the same sigma (if threshold < 0).
+    2. Bio-Gradient: Shallow layers use Standard RoPE, Deep layers use Scaled RoPE (if threshold >= 0).
+    """
+
+    def __init__(self, config: ModelConfig, cache: BufferCache, sigma: float = 1.0, layer_index: Optional[int] = None):
+        """
+        Args:
+            sigma (float): The scaling factor.
+            layer_index (int, optional): The current layer index.
+        """
+        super().__init__(config, cache)
+        
+        # --- 1. 更加健壮的层级控制逻辑 ---
+        
+        # 默认行为：启用 Scaling (即假设我们想要全层应用 Sigma)
+        use_scaling = True
+        
+        # 获取阈值。关键修改：默认值设为 -1 (代表禁用层级策略，保持 Uniform)
+        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活 Bio-Gradient
+        scaling_threshold = getattr(config, "rope_scaling_threshold", -1)
+        
+        # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值 时，才强制关闭 Scaling
+        if scaling_threshold >= 0 and layer_index is not None:
+            if layer_index <= scaling_threshold:
+                use_scaling = False
+                print(f"Layer {layer_index}: Scaling DISABLED (Gradient Mode)")
+        
+        # 否则，use_scaling 保持为 True，即执行原来的逻辑（全层使用传入的 sigma）
+        
+        # --------------------------------
+
+        # 获取维度信息
+        dim = self.config.d_model // self.config.n_heads
+        
+        # --- 2. 如果不启用 Scaling (即退化为 Standard RoPE) ---
+        # 这是针对需要layer分布的前几层，前几层需要使用原始的RoPE
+        if not use_scaling:
+            scale_full = torch.ones(self.config.n_heads, dim)
+            self.register_buffer('scale_factor', scale_full)
+            return 
+
+        # --- 3. 如果启用 Scaling (应用 Sigma) ---
+        
+        if isinstance(sigma, float):
+            sigmas = [sigma] * self.config.n_heads
+        else:
+            sigmas = sigma
+            
+        if len(sigmas) != self.config.n_heads:
+             raise ValueError(f"Sigma count ({len(sigmas)}) must match head count ({self.config.n_heads})")
+
+        with torch.no_grad():
+            device = _non_meta_init_device(config)
+            inv_freq = self.get_inv_freq(device) 
+            
+            sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
+            freqs = inv_freq.view(1, -1) 
+            
+            decay_func = getattr(self.config, 'decay_func', 'gaussian')
+            
+            if decay_func == 'gaussian':
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+            elif decay_func == 'exp':
+                scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + freqs**2) * freqs
+            elif decay_func == 'power':
+                scale = torch.exp(-sigmas_tensor * freqs) * freqs
+            elif decay_func == 'segmented':
+                order = getattr(self.config, 'decay_order', 8)
+                scale = (1.0 / (1.0 + (sigmas_tensor * freqs) ** order)) * freqs
+            else:
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+            
+            scale = torch.sqrt(scale)
+            scale_full = torch.cat((scale, scale), dim=-1)
+
+            correction_factor = torch.rsqrt(torch.mean(scale_full**2))
+            scale_full = scale_full * correction_factor
+
+            self.register_buffer('scale_factor', scale_full)
+
+    def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
+    
+
+
+
+class ScaledRotaryEmbedding0(RotaryEmbedding):
     """
     A rotary embedding that rescales the query and key tensors based on their
     frequency before applying the rotation. A Gaussian window is applied to the
@@ -576,6 +668,9 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
         self.sigma_vertical = getattr(config, "sigma_vertical", False)
         super().__init__(config, cache)
         
+
+        # ---------------------------------------------
+
         # --- Start of modifications ---
 
         # sigma vertical (nheads, n_omega_intervals * 2) or horizontal (nheads, 1)
@@ -1102,6 +1197,96 @@ class DiagonalPositionEncoding(nn.Module):
         return cos_mod.to(dtype=dtype)
 
 
+class NoPE(nn.Module):
+    """
+    No Positional Encoding.
+    Just returns q and k as is.
+    """
+    def __init__(self, config: ModelConfig, cache: BufferCache):
+        super().__init__()
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return q, k
+
+
+class XPosEmbedding(RotaryEmbedding):
+    """
+    XPos implementation inheriting from RotaryEmbedding.
+    Includes numerical stability fix for bfloat16 and long sequences.
+    """
+    def __init__(self, config: ModelConfig, cache: BufferCache):
+        super().__init__(config, cache)
+        self.symbolic_scale_base = 512
+        
+        dim = config.d_model // config.n_heads
+        
+        # [关键修复] 调整 Scale 的范围
+        # 原论文公式: (i + 0.4d) / (1.4d) -> 范围约 [0.28, 1.0] -> 导致 1024 步后 NaN
+        # 修正公式: 映射到 [0.95, 1.0] -> 保证 1024 步后数值仍在 bfloat16 范围内
+        # calculation: 0.95^1024 ~= 1.6e-23 (bfloat16 min ~= 1e-38), safe.
+        
+        min_decay = 0.95 
+        max_decay = 1.0
+        
+        # 生成线性插值
+        indices = torch.arange(0, dim, 2, dtype=torch.float32)
+        scale = min_decay + (max_decay - min_decay) * (indices / dim)
+        
+        self.register_buffer("scale", scale)
+
+    def get_scale(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        # Calculate gamma^t
+        t = torch.arange(seq_len, device=device, dtype=self.scale.dtype)
+        power = t[:, None] # [Seq, 1]
+        
+        # [新增] 增加一个极小的 epsilon 防止完全为 0
+        scale_val = self.scale.to(device) ** power # [Seq, Dim/2]
+        
+        # Repeat for sin/cos shape
+        scale_val = torch.cat([scale_val, scale_val], dim=-1) # [Seq, Dim]
+        
+        return scale_val[None, None, :, :]
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.config.rope_full_precision:
+            q_, k_ = q.float(), k.float()
+        else:
+            q_, k_ = q, k
+
+        with torch.autocast(q.device.type, enabled=False):
+            query_len, key_len = q_.shape[-2], k_.shape[-2]
+            
+            # 1. Get Standard RoPE cos/sin
+            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+            pos_sin = pos_sin.type_as(q_)
+            pos_cos = pos_cos.type_as(q_)
+            
+            # 2. Get XPos Scale
+            scale = self.get_scale(key_len, q_.device).type_as(q_)
+
+            # 3. Apply to Q
+            scale_q = scale[:, :, -query_len:, :]
+            sin_q = pos_sin[:, :, -query_len:, :]
+            cos_q = pos_cos[:, :, -query_len:, :]
+            
+            q_emb = (q_ * cos_q) + (self.rotate_half(q_) * sin_q)
+            q_emb = q_emb * scale_q
+            
+            # 4. Apply to K (Inverse Scale)
+            # [关键修复] 增加 clamp 防止除以 0 或数值爆炸
+            scale_k_slice = scale[:, :, :key_len, :]
+            # 限制最小值为 1e-6，防止除零
+            scale_k_safe = torch.clamp(scale_k_slice, min=1e-6)
+            scale_k = 1.0 / scale_k_safe
+            
+            sin_k = pos_sin[:, :, :key_len, :]
+            cos_k = pos_cos[:, :, :key_len, :]
+            
+            k_emb = (k_ * cos_k) + (self.rotate_half(k_) * sin_k)
+            k_emb = k_emb * scale_k
+            
+            return q_emb.type_as(q), k_emb.type_as(k)
+
 
 
 class Activation(nn.Module):
@@ -1265,26 +1450,50 @@ class OLMoBlock(nn.Module):
                 )
             else:
                 self.rotary_emb = FourierEmbedding(config, self.__cache)
+        # === [Model.py 修复代码] ===
         elif self.config.rope:
-            if getattr(self.config, 'use_scaled_rope1', False):
-                # Check for a list of sigmas, otherwise fall back to a single sigma.
-                if hasattr(self.config, 'scaled_rope_sigmas') and self.config.scaled_rope_sigmas is not None:
-                   sigmas = self.config.scaled_rope_sigmas
-                   log.info(f"Using ScaledRotaryEmbedding with per-head sigmas.")
-                else:
-                   sigmas = self.config.scaled_rope_sigma
-                   log.info(f"Using ScaledRotaryEmbedding with shared sigma={sigmas}")
-                
+            use_scaled = getattr(self.config, 'use_scaled_rope1', False)
+            
+            # 1. 获取 Sigma 配置
+            raw_sigma = getattr(self.config, 'scaled_rope_sigmas', None)
+            if raw_sigma is None:
+                raw_sigma = self.config.scaled_rope_sigma
+            
+            current_layer_sigma = raw_sigma
+            
+            # 2. 如果是列表，取当前层的值
+            if use_scaled and isinstance(raw_sigma, list) and len(raw_sigma) == config.n_layers:
+                current_layer_sigma = raw_sigma[self.layer_id]
+                # Log only once per layer to avoid spam
+                # log.info(f"Layer {self.layer_id}: Sigma={current_layer_sigma}")
+
+            # 3. 决策：到底用哪个 Embedding 类？
+            # 如果 current_layer_sigma 是 None，说明这一层不仅不 Scaling，
+            # 甚至不应该实例化 ScaledRotaryEmbedding (因为它处理不了 None)
+            # 我们直接回退到标准 RotaryEmbedding
+            
+            if use_scaled and current_layer_sigma is not None:
                 self.rotary_emb = ScaledRotaryEmbedding(
-                   config, self.__cache, sigma=sigmas
+                    config, 
+                    self.__cache, 
+                    sigma=current_layer_sigma, 
+                    layer_index=self.layer_id
                 )
             elif getattr(self.config, 'use_scaled_rope2', False):
                 self.rotary_emb = ScaledRoPE(config)
-                log.info(f"Using scaled rope2")
             else:
+                # Fallback to Standard RoPE
+                # 当 sigma 为 None 时也会走到这里，这正是我们想要的 (Layer 0, 1)
                 self.rotary_emb = RotaryEmbedding(config, self.__cache)
-                log.info(f"Using RoPE without scale")
+        # ==========================
+        
+        elif getattr(self.config, 'nope', False):
+            self.rotary_emb = NoPE(config, self.__cache)
+            # log.info("Using NoPE (No Positional Encoding)")
 
+        elif getattr(self.config, 'xpos', False):
+            self.rotary_emb = XPosEmbedding(config, self.__cache)
+            # log.info("Using XPos (Extrapolatable Position Embedding)")
 
 
         self.flash_attn_func = None

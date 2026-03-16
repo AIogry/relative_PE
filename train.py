@@ -47,6 +47,28 @@ def run_experiment(cfg: TrainConfig, max_steps: int, log_interval: int, eval_int
 
     # --- Model and Tokenizer Initialization ---
     model = OLMo(cfg.model)
+
+    finetune_path = getattr(cfg, 'finetune_from', None)
+    
+    if finetune_path:
+        print(f"\n[Fine-tuning] Loading pretrained weights from: {finetune_path}")
+        # 加载权重
+        state_dict = torch.load(finetune_path, map_location="cpu")
+        
+        # 处理可能的 key 不匹配
+        if 'model' in state_dict:
+            state_dict = state_dict['model']
+            
+        # 移除 'module.' 前缀 (如果是 DDP 训练出来的)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_k = k.replace('module.', '') if k.startswith('module.') else k
+            new_state_dict[new_k] = v
+            
+        # 宽松加载 (strict=False) 以防万一
+        missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+        print(f"[Fine-tuning] Weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        
     model.to(device)
     
     try:
@@ -62,9 +84,25 @@ def run_experiment(cfg: TrainConfig, max_steps: int, log_interval: int, eval_int
         raise
 
     # --- Data Loading ---
-    # load full dataset
-    train_full = load_from_disk("/data/qijunrong/03-proj/PE/c4_30M_train")
-    val_full = load_from_disk("/data/qijunrong/03-proj/PE/c4_30M_validation")
+    if getattr(cfg, 'dataset_path', None):
+        data_root = cfg.dataset_path
+    else:
+        # 这里填你原本的默认路径，防止不传参数时报错
+        data_root = "/data/qijunrong/03-proj/PE" 
+
+    print(f"Loading data from root: {data_root}")
+    
+    # 拼接路径 (假设你的文件夹名是 c4_30M_train 和 c4_30M_validation)
+    train_path = os.path.join(data_root, "c4_30M_train")
+    val_path = os.path.join(data_root, "c4_30M_validation")
+
+    train_full = load_from_disk(train_path)
+    val_full = load_from_disk(val_path)
+
+
+    # old load full dataset
+    # train_full = load_from_disk("/data/qijunrong/03-proj/PE/c4_30M_train")
+    # val_full = load_from_disk("/data/qijunrong/03-proj/PE/c4_30M_validation")
 
     train_size = min(cfg.train_size, len(train_full))
     val_size = min(cfg.val_size, len(val_full))
@@ -255,6 +293,10 @@ def main():
         action='store_true',
         help="以流式模式加载数据集。"
     )
+
+    parser.add_argument("--finetune_from", type=str, default=None, help="Checkpoint path to load weights from for fine-tuning")
+    parser.add_argument("--dataset_path", type=str, default=None, help="Root path of the dataset")
+
     args = parser.parse_args()
 
     # --- Remove randomness for reproducibility ---
@@ -341,6 +383,14 @@ def main():
         cfg.model.yarn_dynamic_scaling = args.yarn_dynamic_scaling
     else:
         cfg.model.yarn_enabled = False
+
+
+    if args.finetune_from:
+            cfg.finetune_from = args.finetune_from
+
+    if args.dataset_path:
+            cfg.dataset_path = args.dataset_path
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg.model.init_device = str(device)

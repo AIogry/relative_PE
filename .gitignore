@@ -1,3 +1,6 @@
 checkpoints/
 logs/
 training_results/
+*.pt
+*.pth
+results_exp1/

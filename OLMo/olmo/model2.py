@@ -31,6 +31,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import einsum
 
+from typing import List, Union
+
 from .aliases import PathOrStr
 from .beam_search import BeamSearch, Constraint, FinalSequenceScorer, Sampler
 from .config import (
@@ -269,25 +271,23 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, config: ModelConfig, cache: BufferCache):  
         super().__init__()
         self.config = config
-        self.__cache = cache
+        self._cache = cache
         self.inv_freq = self.get_inv_freq(_non_meta_init_device(config))
         # Warm up cache.
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
-    def get_inv_freq(self,device:torch.device):
-        dim = self.config.d_model // self.config.n_heads
-        inv_freq = 1.0 / (
-            self.config.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
-        )
-        if self.config.fope is True and self.config.use_place_cells is False:
-        # Clip frequencies under the floor frequency to zero 
-            inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
-        return inv_freq
     
     def get_inv_freq(self, device: torch.device):
         dim = self.config.d_model // self.config.n_heads
         i = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
 
+        L = self.config.max_sequence_length      # for uniform sampling frequency
+        # uniform sampling frequency
+        if self.config.uniform_frequency:
+            inv_freq = 2.0 * torch.pi * i / (L)  # * dim)
+        else:
+            inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
+
+        # for fope
         if self.config.fope and not self.config.use_place_cells:
             inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
 
@@ -323,17 +323,17 @@ class RotaryEmbedding(nn.Module):
         # Skip cache if dynamic scaling is enabled
         if not getattr(self.config, "yarn_dynamic_scaling", False):
             if (
-                (pos_sin := self.__cache.get("rope_pos_sin")) is not None
-                and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
+                (pos_sin := self._cache.get("rope_pos_sin")) is not None
+                and (pos_cos := self._cache.get("rope_pos_cos")) is not None
                 and pos_sin.shape[-2] >= seq_len
                 and pos_cos.shape[-2] >= seq_len
             ):
                 if pos_sin.device != device:
                     pos_sin = pos_sin.to(device)
-                    self.__cache["rope_pos_sin"] = pos_sin
+                    self._cache["rope_pos_sin"] = pos_sin
                 if pos_cos.device != device:
                     pos_cos = pos_cos.to(device)
-                    self.__cache["rope_pos_cos"] = pos_cos
+                    self._cache["rope_pos_cos"] = pos_cos
                 return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
 
         with torch.autocast(device.type, enabled=False):
@@ -366,55 +366,17 @@ class RotaryEmbedding(nn.Module):
             pos_sin, pos_cos = positions.sin()[None, None, :, :], positions.cos()[None, None, :, :]
 
         if not getattr(self.config, "yarn_dynamic_scaling", False):
-            self.__cache["rope_pos_sin"] = pos_sin
-            self.__cache["rope_pos_cos"] = pos_cos
+            self._cache["rope_pos_sin"] = pos_sin
+            self._cache["rope_pos_cos"] = pos_cos
 
-        return pos_sin, pos_cos    
-
-    def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        if (
-            (pos_sin := self.__cache.get("rope_pos_sin")) is not None
-            and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
-            and pos_sin.shape[-2] >= seq_len
-            and pos_cos.shape[-2] >= seq_len
-        ):
-            if pos_sin.device != device:
-                pos_sin = pos_sin.to(device)
-                self.__cache["rope_pos_sin"] = pos_sin
-            if pos_cos.device != device:
-                pos_cos = pos_cos.to(device)
-                self.__cache["rope_pos_cos"] = pos_cos
-            return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
-
-        with torch.autocast(device.type, enabled=False):
-            dim = self.config.d_model // self.config.n_heads
-            inv_freq = 1.0 / (
-                self.config.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
-            )
-            if self.config.fope is True:
-            # Clip frequencies under the floor frequency to zero 
-                inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
-            self.inv_freq = inv_freq
-            seq = torch.arange(seq_len, device=device, dtype=torch.float)
-            freqs = einsum("i , j -> i j", seq, inv_freq)
-            if self.config.fope:
-                positions = freqs
-            else:
-                positions = torch.cat((freqs, freqs), dim=-1)
-            pos_sin, pos_cos = positions.sin()[None, None, :, :], positions.cos()[None, None, :, :]
-        self.__cache["rope_pos_sin"] = pos_sin
-        self.__cache["rope_pos_cos"] = pos_cos
         return pos_sin, pos_cos
-
+    
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         
         B, nh, T, hs = x.size()
         x = x.view(B, nh, T, 2, hs // 2)
         x1, x2 = x.unbind(dim=-2)
         return torch.cat((-x2, x1), dim=-1)
-
-    def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
 
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -441,108 +403,27 @@ class RotaryEmbedding(nn.Module):
             )
             k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
         return q_.type_as(q), k_.type_as(k)
-# class ScaledRotaryEmbedding(RotaryEmbedding):
-#     """
-#     A rotary embedding that rescales the query and key tensors based on their
-#     frequency before applying the rotation. A Gaussian window is applied to the
-#     frequencies, effectively acting as a low-pass filter.
-#     """
-#     def __init__(self, config: ModelConfig, cache: BufferCache, sigma: float = 1.0):
-#         """
-#         Initializes the ScaledRotaryEmbedding.
 
-#         Args:
-#             config (ModelConfig): The model configuration.
-#             cache (BufferCache): The buffer cache.
-#             sigma (float, optional): The standard deviation of the Gaussian
-#                                      used for rescaling. Defaults to 1.0.
-#         """
-#         super().__init__(config, cache)
-#         self.sigma = sigma
 
-#         with torch.no_grad():
-#             # This class should only be used with standard RoPE, not FoPE.
-#             assert not self.config.fope, "ScaledRotaryEmbedding is not compatible with fope=True"
 
-#             inv_freq = self.inv_freq # Shape: (dim / 2)
 
-#             # The user's formula is exp(-sigma^2 * (1/inv_freq)^2)
-#             # which is exp(-sigma^2 * freq^2). This is a low-pass filter.
-#             scale = torch.zeros_like(inv_freq)
-#             non_zero_mask = inv_freq != 0.0
-#             freq = torch.reciprocal(inv_freq[non_zero_mask])
-#             scale[non_zero_mask] = torch.exp(-self.sigma**2 * freq**2)
-
-#             # In standard RoPE, the head dimension is composed of pairs of sin/cos
-#             # waves of the same frequency. We duplicate the scaling factor to match.
-#             scale_full = torch.cat((scale, scale), dim=-1)
-
-#             # Normalize the scale factor to preserve variance.
-#             # This counteracts the reduction in variance caused by scaling down q and k,
-#             # which can help with training stability.
-#             correction_factor = torch.rsqrt(torch.mean(scale_full**2))
-#             scale_full = scale_full * correction_factor
-
-#             # Register as a buffer so it moves to the correct device with the model.
-#             self.register_buffer('scale_factor', scale_full)
-
-#     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-#         """
-#         Applies scaling to the input tensor `t` (q or k) before applying the rotation.
-#         """
-#         # t has shape (B, nh, T, hs)
-#         # self.scale_factor has shape (hs,)
-#         # The multiplication will broadcast correctly across B, nh, T dimensions.
-#         t_scaled = t * self.scale_factor
-
-#         # Now call the original rotation logic from the parent class on the scaled tensor.
-#         return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
-# A new positional embedding
-class GridEmbedding(nn.Module):
-    def __init__(self, config: ModelConfig, cache: BufferCache):  
-        #print('Using Grid Embedding')
-        super().__init__()
-        self.config = config
-        self.__cache = cache
-        self.inv_freq = self.get_inv_freq(_non_meta_init_device(config))
-        # Warm up cache.
-        if config.sigma is not None:
-            self.get_scale_factor(_non_meta_init_device(config), config.sigma)
-        else:
-            self.scale_factor = None
-        self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
-    def get_scale_factor(self, device: torch.device, sigma) -> torch.Tensor:
-        
-        
+class GridEmbedding(RotaryEmbedding):
+    def __init__(self, config: ModelConfig, cache: BufferCache, sigma):
+        super().__init__(config, cache)
+        # --- Start of modifications ---
         if isinstance(sigma, float):
             # If a single sigma is provided, create a list to use the same value for all heads.
             self.sigma = [sigma] * self.config.n_heads
-        else:
-            self.sigma = sigma
-
-        # Validate that the number of sigmas matches the number of heads.
-        if len(self.sigma) != self.config.n_heads:
-            raise ValueError(
-                f"The number of sigmas ({len(self.sigma)}) must match the number of heads ({self.config.n_heads})."
-            )
 
         with torch.no_grad():
-            device = _non_meta_init_device(self.config)
+            # This class should only be used with standard RoPE, not FoPE.
+            assert not self.config.fope, "ScaledRotaryEmbedding is not compatible with fope=True"
+
+            device = _non_meta_init_device(config)
             inv_freq = self.get_inv_freq(device) # Shape: (dim / 2)
 
-            # Create frequency tensor, handling potential division by zero.
-            # freq = torch.zeros_like(inv_freq)
-            # non_zero_mask = inv_freq != 0.0
-            # freq[non_zero_mask] = torch.reciprocal(inv_freq[non_zero_mask]) # Shape: (dim / 2)
-
-            # Create a tensor of sigmas for broadcasting. Shape: (n_heads, 1)
             sigmas_tensor = torch.tensor(self.sigma, device=device, dtype=torch.float).view(self.config.n_heads, 1)
 
-            # Calculate scale for each head by broadcasting sigmas against frequencies.
-            # sigmas_tensor**2 has shape (n_heads, 1)
-            # freq.view(1, -1)**2 has shape (1, dim / 2)
-            # Resulting `scale` has shape (n_heads, dim / 2)
-            #print(inv_freq)
             if hasattr(self.config, 'decay_func'):
                 if self.config.decay_func == 'gaussian':
                     scale = torch.exp(-sigmas_tensor**2 * inv_freq.view(1, -1)**2/2)*inv_freq.view(1, -1)
@@ -569,48 +450,89 @@ class GridEmbedding(nn.Module):
             #print(self.scale_factor)
         # --- End of modifications ---
 
-    def get_inv_freq(self,device:torch.device):
-        dim = self.config.d_model // self.config.n_heads
-        inv_freq = 1.0 / (
-            self.config.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq
     def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        if (
-            (pos_cos_sin := self.__cache.get("pos_cos_sin")) is not None
-            and pos_cos_sin.shape[-2] >= seq_len
-        ):
-            if pos_cos_sin.device != device:
-                pos_cos_sin = pos_cos_sin.to(device)
-                self.__cache["pos_cos_sin"] = pos_cos_sin
-            return pos_cos_sin[:, :, :seq_len, :]
+        # Skip cache if dynamic scaling is enabled
+        if not getattr(self.config, "yarn_dynamic_scaling", False):
+            if (
+                (pos_sin := self._cache.get("rope_pos_sin")) is not None
+                and (pos_cos := self._cache.get("rope_pos_cos")) is not None
+                and pos_sin.shape[-2] >= seq_len
+                and pos_cos.shape[-2] >= seq_len
+            ):
+                if pos_sin.device != device:
+                    pos_sin = pos_sin.to(device)
+                    self._cache["rope_pos_sin"] = pos_sin
+                if pos_cos.device != device:
+                    pos_cos = pos_cos.to(device)
+                    self._cache["rope_pos_cos"] = pos_cos
+                return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
 
         with torch.autocast(device.type, enabled=False):
             dim = self.config.d_model // self.config.n_heads
-            inv_freq = 1.0 / (
-                self.config.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
-            )
-            if self.config.fope is True:
-            # Clip frequencies under the floor frequency to zero 
-                inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
-            self.inv_freq = inv_freq
-            seq = torch.arange(seq_len, device=device, dtype=torch.float)
-            freqs = einsum("i , j -> i j", seq, inv_freq)
+
+            # Reconstruct inv_freq with dynamic scale if needed
+            if getattr(self.config, "yarn_dynamic_scaling", False) and getattr(self.config, "yarn_enabled", False):
+                base_len = self.config.yarn_max_position_embeddings
+                scale = max(1.0, seq_len / base_len)
+                # Recompute inv_freq with this scale
+                i = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+                inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
+                if scale > 1.0:
+                    r = base_len * inv_freq
+                    alpha = self.config.yarn_beta_slow
+                    beta = self.config.yarn_beta_fast
+                    gamma = _yarn_ramp(r, alpha, beta)
+                    interpolation_factor = (1 - gamma) / scale + gamma
+                    inv_freq = inv_freq / interpolation_factor
+                self._mscale = _yarn_get_mscale(scale)
+            else:
+                inv_freq = self.inv_freq.to(device)
+
+        seq = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", seq, inv_freq)  # (seq_len, dim/2)
+
+        if self.config.fope:
             positions = freqs
-            pos_cos_sin = torch.cat((positions.cos()[None, None, :, :], positions.sin()[None, None, :, :]), dim=-1)
-        if self.scale_factor is not None:
-            # Apply scaling to the position embeddings
-            pos_cos_sin = pos_cos_sin * self.scale_factor.view(1, self.config.n_heads, 1, -1)
-        self.__cache["pos_cos_sin"] = pos_cos_sin
-        return pos_cos_sin
-    def reorder_half(self, x: torch.Tensor) -> torch.Tensor:
-        
-        B, nh, T, hs = x.size()
-        x = x.view(B, nh, T, 2, hs // 2)
-        x1, x2 = x.unbind(dim=-2)
-        return torch.cat((x2, x1), dim=-1)
-    def apply_rotary_pos_emb(self, pos_cos_sin: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return ((t * pos_cos_sin) + (self.reorder_half(t) * pos_cos_sin)).to(t.dtype) 
+        else:
+            positions = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim)
+
+        # zeros mask
+        half_dim = positions.shape[-1] // 2
+        zeros_half = torch.zeros(seq_len, half_dim, device=device)
+
+        pos_sin = torch.cat([
+            zeros_half,
+            freqs.sin()
+        ], dim=-1)[None, None, :, :]
+
+        pos_cos = torch.cat([
+            freqs.cos(),
+            zeros_half 
+        ], dim=-1)[None, None, :, :]
+
+        if not getattr(self.config, "yarn_dynamic_scaling", False):
+            self._cache["rope_pos_sin"] = pos_sin
+            self._cache["rope_pos_cos"] = pos_cos
+
+        return pos_sin, pos_cos    
+
+    def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Applies scaling to the input tensor `t` (q or k) before applying the rotation.
+        """
+        # --- Start of modifications ---
+
+        # t has shape (B, nh, T, hs)
+        # self.scale_factor has shape (nh, hs)
+        # We reshape scale_factor to (1, nh, 1, hs) for broadcasting.
+        # t = t.view(B, nh, T, 2, hs//2)
+        # t1, t2 = t.unbind(dim=-2)
+        # t = torch.cat(())
+
+        t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        # --- End of modifications ---
+        return t_scaled * pos_cos + t_scaled * pos_sin
+    
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
@@ -619,17 +541,111 @@ class GridEmbedding(nn.Module):
 
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]  # could be different if layer_past not None
-            pos_cos_sin = self.get_rotary_embedding(key_len, q_.device)
-            pos_cos_sin = pos_cos_sin.type_as(q_)
+            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+            pos_sin = pos_sin.type_as(q_)
+            pos_cos = pos_cos.type_as(q_)
             q_ = self.apply_rotary_pos_emb(
-                pos_cos_sin[:, :, key_len - query_len : key_len, :],
+                pos_sin[:, :, key_len - query_len : key_len, :],
+                pos_cos[:, :, key_len - query_len : key_len, :],
                 q_,
             )
-            k_ = self.apply_rotary_pos_emb(pos_cos_sin, k_)
+            k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
         return q_.type_as(q), k_.type_as(k)
-from typing import List, Union
+    
+
 
 class ScaledRotaryEmbedding(RotaryEmbedding):
+    """
+    Scaled RoPE with Optional Layer-wise Control.
+    Modes:
+    1. Uniform Scaling: All layers use the same sigma (if threshold < 0).
+    2. Bio-Gradient: Shallow layers use Standard RoPE, Deep layers use Scaled RoPE (if threshold >= 0).
+    """
+
+    def __init__(self, config: ModelConfig, cache: BufferCache, sigma: float = 1.0, layer_index: Optional[int] = None):
+        """
+        Args:
+            sigma (float): The scaling factor.
+            layer_index (int, optional): The current layer index.
+        """
+        super().__init__(config, cache)
+        
+        # --- 1. 更加健壮的层级控制逻辑 ---
+        
+        # 默认行为：启用 Scaling (即假设我们想要全层应用 Sigma)
+        use_scaling = True
+        
+        # 获取阈值。关键修改：默认值设为 -1 (代表禁用层级策略，保持 Uniform)
+        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活 Bio-Gradient
+        scaling_threshold = getattr(config, "rope_scaling_threshold", -1)
+        
+        # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值 时，才强制关闭 Scaling
+        if scaling_threshold >= 0 and layer_index is not None:
+            if layer_index <= scaling_threshold:
+                use_scaling = False
+                print(f"Layer {layer_index}: Scaling DISABLED (Gradient Mode)")
+        
+        # 否则，use_scaling 保持为 True，即执行原来的逻辑（全层使用传入的 sigma）
+        
+        # --------------------------------
+
+        # 获取维度信息
+        dim = self.config.d_model // self.config.n_heads
+        
+        # --- 2. 如果不启用 Scaling (即退化为 Standard RoPE) ---
+        # 这是针对需要layer分布的前几层，前几层需要使用原始的RoPE
+        if not use_scaling:
+            scale_full = torch.ones(self.config.n_heads, dim)
+            self.register_buffer('scale_factor', scale_full)
+            return 
+
+        # --- 3. 如果启用 Scaling (应用 Sigma) ---
+        
+        if isinstance(sigma, float):
+            sigmas = [sigma] * self.config.n_heads
+        else:
+            sigmas = sigma
+            
+        if len(sigmas) != self.config.n_heads:
+             raise ValueError(f"Sigma count ({len(sigmas)}) must match head count ({self.config.n_heads})")
+
+        with torch.no_grad():
+            device = _non_meta_init_device(config)
+            inv_freq = self.get_inv_freq(device) 
+            
+            sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
+            freqs = inv_freq.view(1, -1) 
+            
+            decay_func = getattr(self.config, 'decay_func', 'gaussian')
+            
+            if decay_func == 'gaussian':
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+            elif decay_func == 'exp':
+                scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + freqs**2) * freqs
+            elif decay_func == 'power':
+                scale = torch.exp(-sigmas_tensor * freqs) * freqs
+            elif decay_func == 'segmented':
+                order = getattr(self.config, 'decay_order', 8)
+                scale = (1.0 / (1.0 + (sigmas_tensor * freqs) ** order)) * freqs
+            else:
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+            
+            scale = torch.sqrt(scale)
+            scale_full = torch.cat((scale, scale), dim=-1)
+
+            correction_factor = torch.rsqrt(torch.mean(scale_full**2))
+            scale_full = scale_full * correction_factor
+
+            self.register_buffer('scale_factor', scale_full)
+
+    def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
+    
+
+
+
+class ScaledRotaryEmbedding0(RotaryEmbedding):
     """
     A rotary embedding that rescales the query and key tensors based on their
     frequency before applying the rotation. A Gaussian window is applied to the
@@ -652,6 +668,9 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
         self.sigma_vertical = getattr(config, "sigma_vertical", False)
         super().__init__(config, cache)
         
+
+        # ---------------------------------------------
+
         # --- Start of modifications ---
 
         # sigma vertical (nheads, n_omega_intervals * 2) or horizontal (nheads, 1)
@@ -732,15 +751,32 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
             # Resulting `scale` has shape (n_heads, dim / 2)
             #print(inv_freq)
             if hasattr(self.config, 'decay_func'):
+                freqs = inv_freq.view(1, -1) # theta
+
                 if self.config.decay_func == 'gaussian':
-                    scale = torch.exp(-sigmas_tensor**2 * inv_freq.view(1, -1)**2/2)*inv_freq.view(1, -1)
+                    scale = torch.exp(-sigmas_tensor**2 * freqs**2/2)*freqs
                 elif self.config.decay_func == 'exp':
                     #print('using exponential decay function')
-                    scale = (1/sigmas_tensor)**2/((1/sigmas_tensor)**2+inv_freq.view(1, -1)**2)*inv_freq.view(1, -1)
+                    scale = (1/sigmas_tensor)**2/((1/sigmas_tensor)**2+freqs**2)*freqs
                 elif self.config.decay_func == 'power':
-                    scale = torch.exp(-sigmas_tensor*inv_freq.view(1, -1))*inv_freq.view(1, -1)
+                    scale = torch.exp(-sigmas_tensor*freqs)*freqs
+                elif self.config.decay_func == 'segmented':
+                    # Butterworth filter
+                    # 【New】Segmented Frequency Scaling (Butterworth Style)
+                    # Flat-top decay, lowpass filtering
+                    # when theta < 1/sigma, scale approx 1
+                    # when theta > 1/sigma, scale decay steeply
+                    # decay_order (k) control the steepness of the descent
+                    
+                    order = getattr(self.config, 'decay_order', 8) # default = 8, it produces a distinct "segmentation" effect.
+                    
+                    # 核心公式: 1 / (1 + (sigma * theta)^k)
+                    filter_profile = 1.0 / (1.0 + (sigmas_tensor * freqs) ** order)
+                    
+                    # 应用滤波器并保留原始频率密度项 (freqs)
+                    scale = filter_profile * freqs
             else:
-                scale = torch.exp(-sigmas_tensor**2 * inv_freq.view(1, -1)**2/2)*inv_freq.view(1, -1)
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2)*freqs
             #print(scale)
             scale = torch.sqrt(scale)
             # In standard RoPE, the head dimension is composed of pairs of sin/cos
@@ -869,7 +905,7 @@ class ScaledRoPE(nn.Module):
     def __init__(self, config, cache):
         super().__init__()
         self.config = config
-        self.__cache = cache  # OLMo's BufferCache
+        self._cache = cache  # OLMo's BufferCache
         self.d_head = config.d_model // config.n_heads
         self.d_half = self.d_head // 2
         self.lambda_val = getattr(config, 'sin_lambda', 1.0)
@@ -896,17 +932,17 @@ class ScaledRoPE(nn.Module):
 
         # 尝试从缓存读取
         if (
-            (pos_sin := self.__cache.get(cache_key_sin)) is not None
-            and (pos_cos := self.__cache.get(cache_key_cos)) is not None
+            (pos_sin := self._cache.get(cache_key_sin)) is not None
+            and (pos_cos := self._cache.get(cache_key_cos)) is not None
             and pos_sin.shape[-2] >= seq_len
             and pos_cos.shape[-2] >= seq_len
         ):
             if pos_sin.device != device:
                 pos_sin = pos_sin.to(device)
-                self.__cache[cache_key_sin] = pos_sin
+                self._cache[cache_key_sin] = pos_sin
             if pos_cos.device != device:
                 pos_cos = pos_cos.to(device)
-                self.__cache[cache_key_cos] = pos_cos
+                self._cache[cache_key_cos] = pos_cos
             return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
 
         # 缓存未命中，重新计算
@@ -918,8 +954,8 @@ class ScaledRoPE(nn.Module):
             pos_cos = positions.cos()[None, None, :, :]
 
         # 存入缓存
-        self.__cache[cache_key_sin] = pos_sin
-        self.__cache[cache_key_cos] = pos_cos
+        self._cache[cache_key_sin] = pos_sin
+        self._cache[cache_key_cos] = pos_cos
         return pos_sin, pos_cos
 
     def _apply_scaling_and_rotation(self, x: torch.Tensor, cos_emb: torch.Tensor, sin_emb: torch.Tensor) -> torch.Tensor:
@@ -974,6 +1010,62 @@ class ScaledRoPE(nn.Module):
             k_rot = self._apply_scaling_and_rotation(k_, pos_cos_k, pos_sin_k)
 
         return q_rot.type_as(q), k_rot.type_as(k)
+
+class DiagPositionEmbedding(nn.Module):
+    def __init__(self, config, cache):
+        super().__init__()
+        self.dim = config.d_model // config.n_heads  # head_dim
+        self.base = getattr(config, "rope_theta", 10000.0)
+        self.max_seq_len = getattr(config, "max_sequence_length", 8192)
+
+        # 构建 theta_d = base^(-2d/dim)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        # 保存为 buffer，支持缓存
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def _update_cos_sin_tables(self, x, seq_len):
+        # x: (B, nh, T, hd)
+        if seq_len > self.max_seq_len:
+            # 动态外推（可选）
+            self.max_seq_len = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._cos_cached = emb.cos()[None, None, :, :]  # (1,1,T,hd)
+            self._sin_cached = emb.sin()[None, None, :, :]
+        elif self._cos_cached is None or self._cos_cached.shape[-2] < seq_len:
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._cos_cached = emb.cos()[None, None, :, :]
+            self._sin_cached = emb.sin()[None, None, :, :]
+
+    def apply_rotary_pos_emb(self, x, cos, sin):
+        # x: (B, nh, T, hd)
+        x1 = x[..., : self.dim // 2]
+        x2 = x[..., self.dim // 2 :]
+        return torch.cat(
+            [
+                x1 * cos - x2 * sin,
+                x2 * cos + x1 * sin,
+            ],
+            dim=-1,
+        )
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # q, k: (B, nh, T, hd)
+        seq_len = q.shape[-2]
+        self._update_cos_sin_tables(q, seq_len)
+
+        cos = self._cos_cached[:, :, :seq_len, :]
+        sin = self._sin_cached[:, :, :seq_len, :]
+
+        q_embed = self.apply_rotary_pos_emb(q, cos, sin)
+        k_embed = self.apply_rotary_pos_emb(k, cos, sin)
+        return q_embed, k_embed
+
 
 class FourierEmbedding(RotaryEmbedding):
     def __init__(self, config: ModelConfig, cache: BufferCache):
@@ -1066,6 +1158,46 @@ class PlaceCellEmbedding(FourierEmbedding):
             self.sin_coef *= scale[None, :, None]
             #print(self.sin_coef.shape)
             self.cos_coef *= scale[None, :, None]
+
+
+class DiagonalPositionEncoding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim = config.d_model  # 注意：这里用 full d_model，不是 head_dim
+        # 你也可以用 head_dim，但需确保与 attention 中 q,k 的最后一维对齐
+        base = getattr(config, "rope_theta", 10000.0)
+        # 频率 theta_d = base^(-2d/dim)
+        theta = base ** (-2.0 * torch.arange(0, self.dim).float() / self.dim)
+        self.register_buffer("theta", theta, persistent=True)
+
+    def compute_cos_modulation(
+        self,
+        seq_len_q: int,
+        seq_len_k: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        offset_q: int = 0,
+        offset_k: int = 0,
+    ) -> torch.Tensor:
+        """
+        Compute cos((m - n) * theta_d) for all m in [offset_q, offset_q + seq_len_q),
+                                            n in [offset_k, offset_k + seq_len_k)
+        Returns:
+            cos_mod: (seq_len_q, seq_len_k, dim)
+        """
+        # Position indices
+        pos_q = torch.arange(offset_q, offset_q + seq_len_q, device=device, dtype=torch.float32)
+        pos_k = torch.arange(offset_k, offset_k + seq_len_k, device=device, dtype=torch.float32)
+        # (seq_len_q, seq_len_k, 1)
+        pos_diff = pos_q[:, None, None] - pos_k[None, :, None]
+        # (1, 1, dim)
+        theta = self.theta[None, None, :].to(device=device, dtype=torch.float32)
+        # (seq_len_q, seq_len_k, dim)
+        cos_mod = torch.cos(pos_diff * theta)
+        return cos_mod.to(dtype=dtype)
+
+
+
 
 class Activation(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -1205,10 +1337,20 @@ class OLMoBlock(nn.Module):
         )
         self.ff_out._is_residual = True  # type: ignore
 
-        # Rotary embeddings.
 
-        if self.config.grid:
-            self.rotary_emb = GridEmbedding(config, self.__cache)
+        # Rotary embeddings, Grid embedding
+        if getattr(self.config, 'use_diag_pe', False):
+            self.pos_enc = DiagonalPositionEncoding(config)
+            log.info("Using Diagonal Modulated Position Encoding (DMPE): score = sum_d q_d k_d cos((m-n)theta_d)")
+        elif self.config.grid:
+            if hasattr(self.config, 'grid_sigma') and self.config.grid_sigma is not None:
+                sigmas = self.config.grid_sigma
+                log.info(f"Using Grid with per-head sigmas: {sigmas}")
+            else:
+                # Fallback: use a scalar sigma (e.g., from config or default)
+                sigmas = getattr(self.config, 'grid_sigma', 30.0)
+                log.info(f"Using Grid with default value 30.0")
+            self.rotary_emb = GridEmbedding(config, self.__cache, sigmas)
         elif self.config.fope:
             if getattr(self.config, 'use_place_cells', False):
                 # Make sure you have added the PlaceCellEmbedding class to this file
@@ -1218,37 +1360,42 @@ class OLMoBlock(nn.Module):
                 )
             else:
                 self.rotary_emb = FourierEmbedding(config, self.__cache)
-        # Rotary embeddings.
-        if self.config.grid:
-            self.rotary_emb = GridEmbedding(config, self.__cache)
-        elif self.config.fope:
-            if getattr(self.config, 'use_place_cells', False):
-                # Make sure you have added the PlaceCellEmbedding class to this file
-                # or have imported it.
-                self.rotary_emb = PlaceCellEmbedding(
-                    config, self.__cache, sigma=self.config.place_cell_sigma
-                )
-            else:
-                self.rotary_emb = FourierEmbedding(config, self.__cache)
+        # === [Model.py 修复代码] ===
         elif self.config.rope:
-            if getattr(self.config, 'use_scaled_rope1', False):
-                # Check for a list of sigmas, otherwise fall back to a single sigma.
-                if hasattr(self.config, 'scaled_rope_sigmas') and self.config.scaled_rope_sigmas is not None:
-                   sigmas = self.config.scaled_rope_sigmas
-                   log.info(f"Using ScaledRotaryEmbedding with per-head sigmas.")
-                else:
-                   sigmas = self.config.scaled_rope_sigma
-                   log.info(f"Using ScaledRotaryEmbedding with shared sigma={sigmas}")
-                
+            use_scaled = getattr(self.config, 'use_scaled_rope1', False)
+            
+            # 1. 获取 Sigma 配置
+            raw_sigma = getattr(self.config, 'scaled_rope_sigmas', None)
+            if raw_sigma is None:
+                raw_sigma = self.config.scaled_rope_sigma
+            
+            current_layer_sigma = raw_sigma
+            
+            # 2. 如果是列表，取当前层的值
+            if use_scaled and isinstance(raw_sigma, list) and len(raw_sigma) == config.n_layers:
+                current_layer_sigma = raw_sigma[self.layer_id]
+                # Log only once per layer to avoid spam
+                # log.info(f"Layer {self.layer_id}: Sigma={current_layer_sigma}")
+
+            # 3. 决策：到底用哪个 Embedding 类？
+            # 如果 current_layer_sigma 是 None，说明这一层不仅不 Scaling，
+            # 甚至不应该实例化 ScaledRotaryEmbedding (因为它处理不了 None)
+            # 我们直接回退到标准 RotaryEmbedding
+            
+            if use_scaled and current_layer_sigma is not None:
                 self.rotary_emb = ScaledRotaryEmbedding(
-                   config, self.__cache, sigma=sigmas
+                    config, 
+                    self.__cache, 
+                    sigma=current_layer_sigma, 
+                    layer_index=self.layer_id
                 )
             elif getattr(self.config, 'use_scaled_rope2', False):
                 self.rotary_emb = ScaledRoPE(config)
-                log.info(f"Using scaled rope2")
             else:
+                # Fallback to Standard RoPE
+                # 当 sigma 为 None 时也会走到这里，这正是我们想要的 (Layer 0, 1)
                 self.rotary_emb = RotaryEmbedding(config, self.__cache)
-                log.info(f"Using RoPE without scale")
+        # ==========================
 
 
 
@@ -1263,7 +1410,9 @@ class OLMoBlock(nn.Module):
 
                 self.flash_attn_func = flash_attn_func
                 self.flash_attn_varlen_func = flash_attn_varlen_func
+                print(">>> SUCCESS: Flash Attention library loaded successfully!")
             except ModuleNotFoundError:
+                print(">>> WARNING: config.flash_attention=True but 'flash-attn' library not found! Falling back to slow attention.")
                 pass
 
     def reset_parameters(self):
@@ -1326,48 +1475,74 @@ class OLMoBlock(nn.Module):
         cu_doc_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Computes scaled dot product attention on query, key and value tensors, using an optional
-        attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
+        [Modified for Visualization]
+        Computes scaled dot product attention manually to capture weights.
         """
+        # Flash Attention 分支 (训练时用)
         if max_doc_len is not None and cu_doc_lens is not None:
-            assert self.flash_attn_varlen_func is not None, "flash-attn is required for document masking"
-            assert attn_mask is None, "attn-mask is currently not supported with document masking"
+            assert self.flash_attn_varlen_func is not None
+            assert attn_mask is None
             B, T, D = q.size(0), q.size(2), q.size(3)
             r = self.flash_attn_varlen_func(
                 q.transpose(1, 2).view(B * T, -1, D),
                 k.transpose(1, 2).view(B * T, -1, D),
                 v.transpose(1, 2).view(B * T, -1, D),
-                cu_doc_lens,
-                cu_doc_lens,
-                max_doc_len,
-                max_doc_len,
-                dropout_p=dropout_p,
-                causal=is_causal,
+                cu_doc_lens, cu_doc_lens, max_doc_len, max_doc_len,
+                dropout_p=dropout_p, causal=is_causal,
             )
             return r.view(B, T, -1, D).transpose(1, 2)
+            
         elif self.flash_attn_func is not None and attn_mask is None:
             r = self.flash_attn_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=is_causal
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+                dropout_p=dropout_p, causal=is_causal
             )
             return r.transpose(1, 2)
+            
         else:
-            # torch's sdpa doesn't support GQA, so we're doing this
+            # === [修改部分开始] 手动实现 Attention 以获取权重 ===
+            
+            # 1. GQA 处理 (如果 Query 头数 != Key 头数)
             assert k.size(1) == v.size(1)
             num_kv_heads = k.size(1)
             num_q_heads = q.size(1)
             if num_q_heads != num_kv_heads:
                 assert num_q_heads % num_kv_heads == 0
-                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
-                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
 
-            return F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-            )
+            # 2. 计算 Scores: Q * K^T / sqrt(d)
+            # q, k: [Batch, Head, SeqLen, Dim]
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+
+            # 3. 处理 Causal Mask (如果 is_causal=True 且没有传入 mask)
+            if is_causal:
+                # 只有当 attn_mask 为空时才应用 Causal 逻辑
+                # 构建下三角掩码
+                Lq, Lk = q.size(-2), k.size(-2)
+                # (i, j) 只有当 j <= i + (Lk - Lq) 时可见
+                # 这里的逻辑涵盖了 Cache 带来的 Key 长度大于 Query 长度的情况
+                causal_mask = torch.ones((Lq, Lk), device=q.device, dtype=torch.bool).tril(diagonal=Lk - Lq)
+                attn_scores = attn_scores.masked_fill(~causal_mask, torch.finfo(attn_scores.dtype).min)
+
+            # 4. 应用外部传入的 attn_mask (如果有)
+            if attn_mask is not None:
+                attn_scores += attn_mask
+
+            # 5. Softmax 计算权重
+            attn_weights = F.softmax(attn_scores, dim=-1)
+
+            # === [关键点] 保存权重到 self ===
+            # 使用 detach() 和 cpu() 节省显存，防止影响推理
+            self.last_attn_weights = attn_weights.detach()
+            # ===============================
+
+            # 6. Dropout 和 Value 聚合
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+            return torch.matmul(attn_weights, v)
+            
+            # === [修改部分结束] ===
+
 
     def attention(
         self,
@@ -1380,7 +1555,7 @@ class OLMoBlock(nn.Module):
         max_doc_len: Optional[int] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        B, T, C = q.size()  # batch size, sequence length, d_model
+        B, T_q, C = q.size()  # T_q = current query length
         dtype = k.dtype
 
         # Optionally apply layer norm to keys and queries.
@@ -1388,55 +1563,117 @@ class OLMoBlock(nn.Module):
             q = self.q_norm(q).to(dtype=dtype)
             k = self.k_norm(k).to(dtype=dtype)
 
-        # Move head forward to be next to the batch dim.
-        # shape: (B, nh, T, hs)
-        q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
-        k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
-        v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
+        # Reshape for multi-head: (B, nh, T, hs)
+        q = q.view(B, T_q, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
+        k = k.view(B, T_q, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
+        v = v.view(B, T_q, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
 
+        # Handle past key/values for caching
+        offset_k = 0
         if layer_past is not None:
             past_key, past_value = layer_past
             k = torch.cat((past_key, k), dim=-2)
             v = torch.cat((past_value, v), dim=-2)
+            offset_k = past_key.size(-2)  # number of cached tokens
 
         present = (k, v) if use_cache else None
-        query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
+        T_k = k.size(-2)  # total key length (including cache)
 
-        if self.config.rope:
-            # Apply rotary embeddings.
-            q, k = self.rotary_emb(q, k)
+        # ----------------------------
+        # ✅ NEW: Diagonal Modulated PE
+        # ----------------------------
+        if getattr(self.config, 'use_diag_pe', False):
+            # We do NOT use FlashAttention or SDPA — compute scores manually
+            assert max_doc_len is None and cu_doc_lens is None, "Document masking not supported in DMPE yet"
 
-        if attention_bias is not None:
-            # Resize and cast attention bias.
-            # The current dtype of the attention bias might not match the dtype that the SDP attn function will
-            # run in if AMP is enabled, and this can be a problem if some tokens are masked out due to padding
-            # as down-casting the attention bias to the autocast precision will result in -infs, which will
-            # cause the SDP attn function to produce NaNs.
-            attention_bias = self._cast_attn_bias(
-                attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
+            # Expand k/v heads if needed (GQA)
+            num_kv_heads = k.size(1)
+            num_q_heads = q.size(1)
+            if num_q_heads != num_kv_heads:
+                assert num_q_heads % num_kv_heads == 0
+                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+
+            # Compute cos((m - n) * theta_d) for all (m,n,d)
+            # Note: q corresponds to positions [offset_k, offset_k + T_q)
+            #       k corresponds to positions [0, T_k)
+            cos_mod = self.pos_enc.compute_cos_modulation(
+                seq_len_q=T_q,
+                seq_len_k=T_k,
+                device=q.device,
+                dtype=q.dtype,
+                offset_q=offset_k,
+                offset_k=0,
+            )  # (T_q, T_k, D_full)
+
+            # But q,k are per-head, with head_dim = D_full / n_heads
+            head_dim = q.size(-1)
+            # Repeat cos_mod for each head (same modulation across heads)
+            cos_mod = cos_mod.unsqueeze(0).unsqueeze(0)  # (1, 1, T_q, T_k, D_full)
+            cos_mod = cos_mod.view(1, 1, T_q, T_k, self.config.n_heads, head_dim)  # (1,1,Tq,Tk,nh,hd)
+            cos_mod = cos_mod.permute(0, 4, 2, 3, 1, 5)  # (1, nh, Tq, Tk, 1, hd)
+            cos_mod = cos_mod.squeeze(-2)  # (1, nh, Tq, Tk, hd)
+
+            # Compute q_d * k_d for all (b, h, i, j, d)
+            q_exp = q.unsqueeze(3)  # (B, nh, T_q, 1, hd)
+            k_exp = k.unsqueeze(2)  # (B, nh, 1, T_k, hd)
+            qk_prod = q_exp * k_exp  # (B, nh, T_q, T_k, hd)
+
+            # Apply modulation and sum over d
+            scores = torch.sum(qk_prod * cos_mod, dim=-1)  # (B, nh, T_q, T_k)
+
+            # Scale by 1/sqrt(d)
+            scores = scores / math.sqrt(head_dim)
+
+            # Apply attention bias (if any)
+            if attention_bias is not None:
+                # attention_bias: (B, nh, T_total, T_total)
+                # We need slice: [..., offset_k:offset_k+T_q, :T_k]
+                bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
+                scores = scores + self._cast_attn_bias(bias_slice, dtype)
+
+            # Apply causal mask if no attention_bias
+            if attention_bias is None:
+                causal_mask = torch.triu(
+                    torch.full_like(scores, float("-inf")), diagonal=1 + (T_k - T_q)
+                )
+                scores = scores + causal_mask
+
+            # Softmax + dropout
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = F.dropout(
+                attn_weights,
+                p=self.config.attention_dropout if self.training else 0.0,
+                training=self.training,
             )
 
-        # Get the attention scores.
-        # shape: (B, nh, T, hs)
-        att = self._scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_bias,
-            dropout_p=0.0 if not self.training else self.config.attention_dropout,
-            is_causal=attention_bias is None,
-            max_doc_len=max_doc_len,
-            cu_doc_lens=cu_doc_lens,
-        )
+            # Compute output: (B, nh, T_q, T_k) @ (B, nh, T_k, hd) -> (B, nh, T_q, hd)
+            att = torch.matmul(attn_weights, v)
 
-        # Re-assemble all head outputs side-by-side.
-        att = att.transpose(1, 2).contiguous().view(B, T, C)
+        else:
+            # ----------------------------
+            # Original RoPE / other paths
+            # ----------------------------
+            if hasattr(self, 'rotary_emb') and self.rotary_emb is not None:
+                q, k = self.rotary_emb(q, k)
 
-        # Apply output projection.
+            if attention_bias is not None:
+                bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
+                attention_bias = self._cast_attn_bias(bias_slice, dtype)
+
+            att = self._scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_bias,
+                dropout_p=self.config.attention_dropout if self.training else 0.0,
+                is_causal=attention_bias is None,
+                max_doc_len=max_doc_len,
+                cu_doc_lens=cu_doc_lens,
+            )
+
+        # Reassemble heads
+        att = att.transpose(1, 2).contiguous().view(B, T_q, C)
         return self.attn_out(att), present
-
+    
     @abstractmethod
     def forward(
         self,
@@ -1699,6 +1936,13 @@ class OLMoLlamaBlock(OLMoBlock):
 
         attn_weights += attn_bias
         attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(q.dtype)
+
+        # ==========================================
+        # 🔴 [关键插入] 保存权重到 self，供提取脚本读取
+        # ==========================================
+        self.last_attn_weights = attn_weights.detach().cpu()
+        # ==========================================
+
         attn_weights = nn.functional.dropout(attn_weights, p=dropout_p)
         return torch.matmul(attn_weights, v)
 

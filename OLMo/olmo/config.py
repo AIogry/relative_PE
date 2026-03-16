@@ -393,6 +393,15 @@ class ModelConfig(BaseConfig):
     sigma_vertical: bool =False
 
 
+    rope_scaling_threshold: int = -1
+    """
+    from which layer set sigma
+    """
+
+
+
+
+
 # In olmo/config.py, inside the ModelConfig class
 
     scaled_rope_sigmas: Optional[List[float]] = None
