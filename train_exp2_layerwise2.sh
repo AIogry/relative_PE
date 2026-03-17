@@ -120,22 +120,6 @@ run_experiment() {
 #    done
 # done
 
-# ============================================================
-# 阶段 2: 60M 模型实验 (Length 1024, 2048)
-# ============================================================
-MODEL="60M"
-LENGTHS=(2048)
-
-echo ">>> Starting PHASE 2: 60M Model Experiments..."
-
-for len in "${LENGTHS[@]}"; do
-    # 仅跑 Bio-Gradient
-    for sigma in "${SIGMAS[@]}"; do
-        for thr in "${THRESHOLDS[@]}"; do
-            run_experiment $MODEL $len $sigma $thr
-        done
-    done
-done
 
 
 echo ">>> All Phase 1 & 2 Experiments Finished."
