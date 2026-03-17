@@ -26,11 +26,11 @@ mkdir -p ./logs
 # === 全局配置 ===
 GLOBAL_BS=64
 SEED=6198
-MAX_TOKENS=200000000 # 1亿 Token
+MAX_TOKENS=1000000000 # 1B
 
 # [关键修改] 大幅减少加载的数据量
 # 30万条 C4 数据足够提供 >1.5亿 Token，满足 MAX_TOKENS 需求
-TRAIN_SAMPLES=2000000 
+TRAIN_SAMPLES=5000000      # 5M
 VAL_SAMPLES=10000
 
 # === DEBUG 开关 ===
@@ -74,7 +74,7 @@ for M_SIZE in "${MODELS[@]}"; do
         if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
         OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [NoPE] Model: $M_SIZE | Len: $SEQ_LEN"
+        echo ">>> [NoPE] Model: $M_SIZE | Len: $SEQ_LEN | Micro BS: $CUR_MICRO_BS"
         
         $PYTHON_BIN $SCRIPT \
             --output_dir $OUTPUT_DIR \
@@ -106,7 +106,7 @@ for M_SIZE in "${MODELS[@]}"; do
         if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
         OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [XPos] Model: $M_SIZE | Len: $SEQ_LEN"
+        echo ">>> [XPos] Model: $M_SIZE | Len: $SEQ_LEN | Micro BS: $CUR_MICRO_BS"
         
         $PYTHON_BIN $SCRIPT \
             --output_dir $OUTPUT_DIR \
@@ -139,7 +139,7 @@ for M_SIZE in "${MODELS[@]}"; do
         if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
         OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [RoPE] Model: $M_SIZE | Len: $SEQ_LEN"
+        echo ">>> [RoPE] Model: $M_SIZE | Len: $SEQ_LEN | Micro BS: $CUR_MICRO_BS"
         
         $PYTHON_BIN $SCRIPT \
             --output_dir $OUTPUT_DIR \
@@ -170,7 +170,7 @@ for M_SIZE in "${MODELS[@]}"; do
         if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
         OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [ALiBi] Model: $M_SIZE | Len: $SEQ_LEN"
+        echo ">>> [ALiBi] Model: $M_SIZE | Len: $SEQ_LEN | Micro BS: $CUR_MICRO_BS"
         
         $PYTHON_BIN $SCRIPT \
             --output_dir $OUTPUT_DIR \
@@ -192,38 +192,38 @@ done
 # ============================================================
 # 3. FoPE (Linear Scaling) on C4
 # ============================================================
-echo ">>> [BATCH START] Running FoPE on C4..."
+# echo ">>> [BATCH START] Running FoPE on C4..."
 
-for M_SIZE in "${MODELS[@]}"; do
-    for SEQ_LEN in "${LENGTHS[@]}"; do
+# for M_SIZE in "${MODELS[@]}"; do
+#    for SEQ_LEN in "${LENGTHS[@]}"; do
         
-        CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
-        SCALE=$(echo "scale=1; $SEQ_LEN / 512.0" | bc)
-        if (( $(echo "$SCALE < 1.0" | bc -l) )); then SCALE=1.0; fi
+#        CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
+#        SCALE=$(echo "scale=1; $SEQ_LEN / 512.0" | bc)
+#        if (( $(echo "$SCALE < 1.0" | bc -l) )); then SCALE=1.0; fi
 
-        RUN_ID="c4_fope_${M_SIZE}_L${SEQ_LEN}"
-        if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-        OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
+#        RUN_ID="c4_fope_${M_SIZE}_L${SEQ_LEN}"
+#        if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
+#        OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [FoPE] Model: $M_SIZE | Len: $SEQ_LEN | Scale: $SCALE"
+#        echo ">>> [FoPE] Model: $M_SIZE | Len: $SEQ_LEN | Scale: $SCALE | Micro BS: $CUR_MICRO_BS"
         
-        $PYTHON_BIN $SCRIPT \
-            --output_dir $OUTPUT_DIR \
-            --run_id $RUN_ID \
-            --model_size $M_SIZE \
-            --dataset_path $C4_DATA_ROOT \
-            --local_tokenizer_path $LOCAL_TOKENIZER \
-            --seq_len $SEQ_LEN \
-            --global_batch_size $GLOBAL_BS \
-            --micro_batch_size $CUR_MICRO_BS \
-            --train_size $TRAIN_SAMPLES \
-            --val_size $VAL_SAMPLES \
-            --fope \
-            --rope_scale $SCALE \
-            $LIMIT_ARGS \
-            --seed $SEED
-    done
-done
+#        $PYTHON_BIN $SCRIPT \
+#            --output_dir $OUTPUT_DIR \
+#            --run_id $RUN_ID \
+#            --model_size $M_SIZE \
+#            --dataset_path $C4_DATA_ROOT \
+#            --local_tokenizer_path $LOCAL_TOKENIZER \
+#            --seq_len $SEQ_LEN \
+#            --global_batch_size $GLOBAL_BS \
+#            --micro_batch_size $CUR_MICRO_BS \
+#            --train_size $TRAIN_SAMPLES \
+#            --val_size $VAL_SAMPLES \
+#            --fope \
+#            --rope_scale $SCALE \
+#            $LIMIT_ARGS \
+#            --seed $SEED
+#    done
+#done
 
 
 

@@ -16,6 +16,8 @@ model:
   pad_token_id: 50256
   init_device: "cuda"
   init_fn: "normal"
+  init_std: 0.02
+  init_cutoff_factor: 3
   weight_tying: false
   attention_dropout: 0.0
   attention_layer_norm: false
@@ -39,6 +41,8 @@ scheduler:
   name: cosine_with_warmup
   t_warmup: 200            # 预热步数
   alpha_f: 0.1
+
+precision: amp_bf16
 
 # --- Batching (会被命令行参数覆盖，但这里留个默认值) ---
 global_train_batch_size: 128

@@ -23,7 +23,8 @@ mkdir -p ./logs
 
 # === 全局配置 ===
 GLOBAL_BS=64
-SEED=6198
+#SEED=6198
+SEEDS=(6198 1024 7 568 3427)     # 5个随机数
 MAX_TOKENS=100000000 # 保持 1亿 Token 总量
 
 # Debug 开关
@@ -43,11 +44,13 @@ fi
 
 # 1. Sigma 列表
 # SIGMAS=(80.0 1.0 10.0 1000.0 0.5 700.0 70.0)   用来测试60m len=2048的
-SIGMAS=(200.0 300.0 500.0 700.0 1000.0)
+# SIGMAS=(200.0 300.0 500.0 700.0 1000.0)
 # SIGMAS=(100.0 500.0)
+SIGMAS=(50.0 100.0 200.0 500.0 700.0 1000.0)
 
 # 2. Threshold 列表
-THRESHOLDS=(2 3 4)
+# THRESHOLDS=(2 3 4)
+THRESHOLDS=(3)
 
 # ============================================================
 # 函数：执行单次训练
@@ -57,14 +60,15 @@ run_experiment() {
     local SEQ_LEN=$2
     local SIGMA=$3
     local THR=$4
+    local SEED=$5
     
     # --- 自动调整 Micro Batch Size 防止 OOM ---
     # 逻辑：序列变长或模型变大时，减小 Micro BS
-    local CUR_MICRO_BS=16  # 默认基准 (20M, 512/1024)
+    local CUR_MICRO_BS=32  # 默认基准 (20M, 512/1024)
 
     # 1. 如果是 60M 模型，基准减半 (因为 d_model 翻倍，显存压力大)
     if [ "$M_SIZE" == "60M" ]; then
-        CUR_MICRO_BS=8
+        CUR_MICRO_BS=16                 # 本来是CUR_MICRO_BS=8，现在改成和baseline一样
     fi
 
     # 2. 如果序列长度 >= 2048，基准再减半
@@ -78,7 +82,7 @@ run_experiment() {
     local OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}_${TIMESTAMP}"
 
     echo "----------------------------------------------------------------"
-    echo ">>> [START] Model: $M_SIZE | Len: $SEQ_LEN | Sigma: $SIGMA | Thr: $THR"
+    echo ">>> [START] Model: $M_SIZE | Len: $SEQ_LEN | Sigma: $SIGMA | Thr: $THR | Seed: $SEED"
     echo ">>> Micro BS: $CUR_MICRO_BS | Output: $OUTPUT_DIR"
     
     $PYTHON_BIN $SCRIPT \
@@ -106,19 +110,39 @@ run_experiment() {
 # ============================================================
 # 阶段 1: 20M 模型实验 (Length 1024, 2048)
 # ============================================================
-# MODEL="20M"
-# LENGTHS=(1024)
+MODEL="20M"
+LENGTHS=(512 1024 2048)
 
-# echo ">>> Starting PHASE 1: 20M Model Experiments..."
+echo ">>> Starting PHASE 1: 20M Model Experiments..."
 
-# for len in "${LENGTHS[@]}"; do
-    # 仅跑 Bio-Gradient
-#    for sigma in "${SIGMAS[@]}"; do
-#        for thr in "${THRESHOLDS[@]}"; do
-#            run_experiment $MODEL $len $sigma $thr
-#        done
-#    done
-# done
+for SEED in "${SEEDS[@]}"; do
+    for len in "${LENGTHS[@]}"; do
+        # 仅跑 HIPE
+        for sigma in "${SIGMAS[@]}"; do
+            for thr in "${THRESHOLDS[@]}"; do
+                run_experiment $MODEL $len $sigma $thr $SEED
+            done
+        done
+    done
+done
+
+# ============================================================
+# 阶段 2: 60M 模型实验 (Length 1024, 2048)
+# ============================================================
+MODEL="60M"
+LENGTHS=(512 1024 2048)
+
+echo ">>> Starting PHASE 2: 60M Model Experiments..."
+for SEED in "${SEEDS[@]}"; do
+    for len in "${LENGTHS[@]}"; do
+        # 仅跑 HIPE
+        for sigma in "${SIGMAS[@]}"; do
+            for thr in "${THRESHOLDS[@]}"; do
+                run_experiment $MODEL $len $sigma $thr $SEED
+            done
+        done
+    done
+done
 
 
 

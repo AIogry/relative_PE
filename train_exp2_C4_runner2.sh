@@ -25,10 +25,10 @@ mkdir -p ./logs
 # === 全局配置 ===
 GLOBAL_BS=64
 SEED=6198
-MAX_TOKENS=200000000 # 1亿 Token
+MAX_TOKENS=1000000000 # 1B
 
 # C4 数据量控制 (与 Baseline 保持一致)
-TRAIN_SAMPLES=2000000
+TRAIN_SAMPLES=5000000      # 5M
 VAL_SAMPLES=10000
 
 # === DEBUG 开关 ===
@@ -69,8 +69,8 @@ run_experiment() {
     local THR=$4
     
     # --- 动态计算 Micro Batch Size ---
-    local CUR_MICRO_BS=16
-    if [ "$M_SIZE" == "60M" ]; then CUR_MICRO_BS=8; fi
+    local CUR_MICRO_BS=32
+    if [ "$M_SIZE" == "60M" ]; then CUR_MICRO_BS=16; fi
     if [ "$SEQ_LEN" -ge 2048 ]; then CUR_MICRO_BS=$((CUR_MICRO_BS / 2)); fi
 
     # 生成 Run ID (包含关键参数)

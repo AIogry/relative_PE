@@ -23,7 +23,8 @@ mkdir -p ./logs
 
 # === 全局配置 ===
 GLOBAL_BS=64
-SEED=6198
+# SEED=6198
+SEEDS=(6198 1024 7 568 3427)     # 5个随机数
 MAX_TOKENS=100000000 # 1亿 Token
 
 # === DEBUG 配置 ===
@@ -60,20 +61,22 @@ get_mbs() {
 # 3. Baseline: XPos
 # ============================================================
 echo ">>> [BATCH START] Running XPos..."
-for M_SIZE in "${MODELS[@]}"; do
-    for SEQ_LEN in "${LENGTHS[@]}"; do
-        CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
-        RUN_ID="baseline_xpos_${M_SIZE}_L${SEQ_LEN}"
-        
-        OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
+for SEED in "${SEEDS[@]}"; do
+    for M_SIZE in "${MODELS[@]}"; do
+        for SEQ_LEN in "${LENGTHS[@]}"; do
+            CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
+            RUN_ID="baseline_xpos_${M_SIZE}_L${SEQ_LEN}"
+            
+            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [XPos] Model: $M_SIZE | Len: $SEQ_LEN"
-        $PYTHON_BIN $SCRIPT \
-            --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-            --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-            --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-            --xpos \
-            $LIMIT_ARGS --seed $SEED
+            echo ">>> [XPos] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
+            $PYTHON_BIN $SCRIPT \
+                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
+                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
+                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
+                --xpos \
+                $LIMIT_ARGS --seed $SEED
+        done
     done
 done
 
@@ -85,29 +88,29 @@ done
 # 显存开销会大幅增加 (O(N^2))，这里将 Micro Batch Size 减半以防 OOM。
 
 echo ">>> [BATCH START] Running ALiBi..."
-for M_SIZE in "${MODELS[@]}"; do
-   for SEQ_LEN in "${LENGTHS[@]}"; do
-       
-       # 获取基础 MBS
-       BASE_MBS=$(get_mbs $M_SIZE $SEQ_LEN)
-       
-       # 针对 ALiBi 减半 MBS (因为没有 FlashAttn)不减半
-       # CUR_MICRO_BS=$((BASE_MBS / 2))
-       if [ "$CUR_MICRO_BS" -lt 1 ]; then CUR_MICRO_BS=1; fi
+for SEED in "${SEEDS[@]}"; do
+    for M_SIZE in "${MODELS[@]}"; do
+    for SEQ_LEN in "${LENGTHS[@]}"; do
+        
+        # 获取基础 MBS
+        BASE_MBS=$(get_mbs $M_SIZE $SEQ_LEN)
+        # CUR_MICRO_BS=$((BASE_MBS / 2))
+        if [ "$CUR_MICRO_BS" -lt 1 ]; then CUR_MICRO_BS=1; fi
 
-       RUN_ID="baseline_alibi_${M_SIZE}_L${SEQ_LEN}"
-       if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-       
-       OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
+        RUN_ID="baseline_alibi_${M_SIZE}_L${SEQ_LEN}"
+        if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
+        
+        OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-       echo ">>> [ALiBi] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS (Reduced for No-FlashAttn)"
-       $PYTHON_BIN $SCRIPT \
-           --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-           --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-           --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-           --alibi \
-           $LIMIT_ARGS --seed $SEED
-   done
+        echo ">>> [ALiBi] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
+        $PYTHON_BIN $SCRIPT \
+            --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
+            --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
+            --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
+            --alibi \
+            $LIMIT_ARGS --seed $SEED
+    done
+    done
 done
 
 
@@ -115,20 +118,22 @@ done
 # 1. Baseline: Standard RoPE
 # ============================================================
 echo ">>> [BATCH START] Running Standard RoPE..."
-for M_SIZE in "${MODELS[@]}"; do
-   for SEQ_LEN in "${LENGTHS[@]}"; do
-       CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
-       RUN_ID="baseline_rope_${M_SIZE}_L${SEQ_LEN}"
-        if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-        
-        OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}" # 去掉时间戳方便覆盖或查看
+for SEED in "${SEEDS[@]}"; do
+    for M_SIZE in "${MODELS[@]}"; do
+    for SEQ_LEN in "${LENGTHS[@]}"; do
+        CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
+        RUN_ID="baseline_rope_${M_SIZE}_L${SEQ_LEN}"
+            if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
+            
+            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}" # 去掉时间戳方便覆盖或查看
 
-        echo ">>> [RoPE] Model: $M_SIZE | Len: $SEQ_LEN"
-        $PYTHON_BIN $SCRIPT \
-            --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-            --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-            --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-            $LIMIT_ARGS --seed $SEED
+            echo ">>> [RoPE] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
+            $PYTHON_BIN $SCRIPT \
+                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
+                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
+                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
+                $LIMIT_ARGS --seed $SEED
+        done
     done
 done
 
@@ -136,20 +141,22 @@ done
 # 2. Baseline: NoPE (No Positional Encoding)
 # ============================================================
 echo ">>> [BATCH START] Running NoPE..."
-for M_SIZE in "${MODELS[@]}"; do
-   for SEQ_LEN in "${LENGTHS[@]}"; do
-        CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
-        RUN_ID="baseline_nope_${M_SIZE}_L${SEQ_LEN}"
-        
-        OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
+for SEED in "${SEEDS[@]}"; do
+    for M_SIZE in "${MODELS[@]}"; do
+    for SEQ_LEN in "${LENGTHS[@]}"; do
+            CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN)
+            RUN_ID="baseline_nope_${M_SIZE}_L${SEQ_LEN}"
+            
+            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-        echo ">>> [NoPE] Model: $M_SIZE | Len: $SEQ_LEN"
-        $PYTHON_BIN $SCRIPT \
-            --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-            --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-            --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-            --nope \
-            $LIMIT_ARGS --seed $SEED
+            echo ">>> [NoPE] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
+            $PYTHON_BIN $SCRIPT \
+                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
+                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
+                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
+                --nope \
+                $LIMIT_ARGS --seed $SEED
+        done
     done
 done
 
