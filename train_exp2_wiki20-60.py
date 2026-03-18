@@ -9,6 +9,8 @@ import json
 import random
 import numpy as np
 import wandb
+import subprocess
+import sys
 from torch.amp import autocast
 from transformers import AutoTokenizer
 
@@ -23,6 +25,69 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def get_git_info():
+    """获取当前代码仓库的Git信息，返回字典"""
+    git_info = {}
+    try:
+        # 1. 获取完整commit hash（唯一标识代码版本）
+        git_info["commit_hash"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], 
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 2. 获取短commit hash（更易读）
+        git_info["short_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 3. 获取当前分支名
+        git_info["branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 4. 检查是否有未提交的修改（dirty/clean）
+        git_status = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        git_info["is_dirty"] = len(git_status) > 0
+        git_info["dirty_files"] = git_status if git_info["is_dirty"] else "None"
+        
+        # 5. 获取远程仓库地址（用于跳转到GitHub）
+        git_info["remote_url"] = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 6. 转换为GitHub网页链接（适配HTTPS/SSH格式）
+        if git_info["remote_url"].startswith("git@"):
+            git_info["github_commit_url"] = git_info["remote_url"].replace(
+                "git@github.com:", "https://github.com/"
+            ).replace(".git", "") + f"/commit/{git_info['commit_hash']}"
+        elif git_info["remote_url"].startswith("https"):
+            git_info["github_commit_url"] = git_info["remote_url"].replace(
+                ".git", ""
+            ) + f"/commit/{git_info['commit_hash']}"
+        else:
+            git_info["github_commit_url"] = "Unknown"
+            
+    except subprocess.CalledProcessError as e:
+        # Git命令执行失败（如非Git仓库、无权限）
+        git_info["error"] = f"Git command failed: {e.output.decode('utf-8')}"
+        git_info["commit_hash"] = "unknown"
+        git_info["short_commit"] = "unknown"
+    except Exception as e:
+        # 其他异常（如编码错误）
+        git_info["error"] = f"Get git info failed: {str(e)}"
+        git_info["commit_hash"] = "unknown"
+        git_info["short_commit"] = "unknown"
+    
+    return git_info
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -64,13 +129,19 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_tags = [args.model_size, f"len_{args.seq_len}", f"seed_{args.seed}"]
+
+    git_info = get_git_info()
+    # 将Git短哈希加入tags，方便在wandb中快速筛选
+
+    run_tags = [args.model_size, f"len_{args.seq_len}", f"seed_{args.seed}"]  # 先初始化
+    run_tags.append(f"commit_{git_info['short_commit']}")  # 后追加
+    run_tags.append(f"dirty_{git_info['is_dirty']}" if "is_dirty" in git_info else "dirty_unknown")
 
     if args.alibi or args.xpos or args.fope or args.nope or not args.use_scaled_rope:
-        run_group = "Exp2-20Mand60M-Baselines"
+        run_group = "Exp2-wiki-Baselines"
         run_tags.append("baseline")
     else:
-        run_group = "Exp2-20Mand60M-HIPE"
+        run_group = "Exp2-wiki-HIPE"
         run_tags.append("hipe")
         run_tags.append(f"sigma_{args.sigma}")
 
@@ -80,8 +151,10 @@ def main():
         tags=run_tags,
         name=args.run_id,             # 使用 bash 脚本中生成的精确 run_id 作为实验名
         config=vars(args),            # 将所有 argparse 的参数自动保存到 wandb config 中
-        dir=args.output_dir           # 将本地日志也保存在 output_dir 下，方便管理
+        dir=args.output_dir          # 将本地日志也保存在 output_dir 下，方便管理
     )
+
+    wandb.config.update(git_info)
 
     # 处理 Sigma List
     final_sigmas = None
@@ -96,7 +169,7 @@ def main():
     raw_vocab_size = tokenizer.vocab_size
     vocab_size = ((raw_vocab_size + 63) // 64) * 64
     print(f">>> Resizing Vocab: {raw_vocab_size} -> {vocab_size} (Aligned to 64)")
-    
+
     wandb.config.update({"actual_vocab_size": vocab_size})
     # =========================================================================
     # [优化] 数据预处理：一次性分词，不再在训练循环中分词
@@ -252,7 +325,12 @@ def main():
 
     print(f"Model Params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     print(f"Experiment: {args.run_id} -> Saving to {args.output_dir}")
-    
+    print(f">>> Git Commit: {git_info['commit_hash']} (short: {git_info['short_commit']})")
+    print(f">>> Git Branch: {git_info.get('branch', 'unknown')}")
+    print(f">>> Code Dirty: {git_info.get('is_dirty', 'unknown')}")
+
+
+
     model.train()
     step = 0
     total_loss = 0.0 
@@ -262,6 +340,13 @@ def main():
     
     log_path = os.path.join(args.output_dir, "log.txt")
     log_file = open(log_path, "w")
+    log_file.write(f"Git Commit: {git_info['commit_hash']}\n")
+    log_file.write(f"Git Short Commit: {git_info['short_commit']}\n")
+    log_file.write(f"Git Branch: {git_info.get('branch', 'unknown')}\n")
+    log_file.write(f"Code Dirty: {git_info.get('is_dirty', 'unknown')}\n")
+    log_file.write(f"GitHub Commit URL: {git_info.get('github_commit_url', 'unknown')}\n")
+    log_file.write("Step,Loss,PPL\n")
+    log_file.flush()
 
     LOG_INTERVAL = 10 
 
@@ -295,7 +380,7 @@ def main():
             avg_loss = total_loss / LOG_INTERVAL
             ppl = math.exp(avg_loss) if avg_loss < 20 else 1e9
             lr = scheduler.get_last_lr()[0]
-            print(f"Step {step}/{total_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.2f} | LR: {lr:.2e}")
+            print(f"Step {step}/{total_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.4f} | LR: {lr:.2e}")
 
             wandb.log({
                 "train/loss": avg_loss,
@@ -304,7 +389,7 @@ def main():
                 "step": step
             })
 
-            log_file.write(f"{step},{avg_loss},{ppl}\n")
+            log_file.write(f"Step {step},Loss: {avg_loss:.4f},PPL: {ppl:.4f}\n")
             log_file.flush()
             total_loss = 0.0
 
@@ -337,7 +422,7 @@ def main():
                 # 增加上限保护，防止训练早期极度发散时 math.exp 报错 (OverflowError)
                 val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else 1e9 
                 
-                print(f">>> VAL PPL: {val_ppl:.2f}")
+                print(f">>> VAL PPL: {val_ppl:.4f}")
 
                 wandb.log({
                     "val/loss": avg_val_loss,
