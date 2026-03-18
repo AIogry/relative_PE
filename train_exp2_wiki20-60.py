@@ -8,6 +8,7 @@ import math
 import json
 import random
 import numpy as np
+import wandb
 from torch.amp import autocast
 from transformers import AutoTokenizer
 
@@ -56,13 +57,31 @@ def main():
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_interval", type=int, default=100)
-    parser.add_argument("--eval_steps", type=int, default=20)
     
     args = parser.parse_args()
     set_seed(args.seed)
     
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    run_tags = [args.model_size, f"len_{args.seq_len}", f"seed_{args.seed}"]
+
+    if args.alibi or args.xpos or args.fope or args.nope or not args.use_scaled_rope:
+        run_group = "Exp2-20Mand60M-Baselines"
+        run_tags.append("baseline")
+    else:
+        run_group = "Exp2-20Mand60M-HIPE"
+        run_tags.append("hipe")
+        run_tags.append(f"sigma_{args.sigma}")
+
+    wandb.init(
+        project="Position Embedding",   # 替换为你的项目名称
+        group=run_group,
+        tags=run_tags,
+        name=args.run_id,             # 使用 bash 脚本中生成的精确 run_id 作为实验名
+        config=vars(args),            # 将所有 argparse 的参数自动保存到 wandb config 中
+        dir=args.output_dir           # 将本地日志也保存在 output_dir 下，方便管理
+    )
 
     # 处理 Sigma List
     final_sigmas = None
@@ -74,11 +93,11 @@ def main():
 
     print(f"Loading Tokenizer from {args.local_tokenizer_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.local_tokenizer_path)
-    
     raw_vocab_size = tokenizer.vocab_size
     vocab_size = ((raw_vocab_size + 63) // 64) * 64
     print(f">>> Resizing Vocab: {raw_vocab_size} -> {vocab_size} (Aligned to 64)")
-
+    
+    wandb.config.update({"actual_vocab_size": vocab_size})
     # =========================================================================
     # [优化] 数据预处理：一次性分词，不再在训练循环中分词
     # =========================================================================
@@ -277,6 +296,14 @@ def main():
             ppl = math.exp(avg_loss) if avg_loss < 20 else 1e9
             lr = scheduler.get_last_lr()[0]
             print(f"Step {step}/{total_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.2f} | LR: {lr:.2e}")
+
+            wandb.log({
+                "train/loss": avg_loss,
+                "train/ppl": ppl,
+                "train/lr": lr,
+                "step": step
+            })
+
             log_file.write(f"{step},{avg_loss},{ppl}\n")
             log_file.flush()
             total_loss = 0.0
@@ -284,35 +311,55 @@ def main():
         if step % args.eval_interval == 0:
             print(">>> Running Validation...")
             model.eval()
-            val_loss_accum = 0.0
-            val_count = 0
-            val_iter = iter(val_loader)
+            total_val_loss = 0.0
+            total_val_tokens = 0
+            
             with torch.no_grad():
-                for _ in range(args.eval_steps):
-                    try:
-                        vx, vy = next(val_iter)
-                    except StopIteration:
-                        break
+                # 直接遍历整个验证集，不再受 eval_steps 和 mbs 限制
+                for vx, vy in val_loader:
                     vx, vy = vx.to(device), vy.to(device)
                     
                     with autocast(device_type='cuda', dtype=torch.bfloat16):
                         outputs = model(input_ids=vx)
-                        loss = nn.functional.cross_entropy(outputs.logits.view(-1, vocab_size), vy.view(-1))
+                        # 注意：这里改为 reduction='sum'，计算当前批次所有 token 的 loss 总和
+                        loss = nn.functional.cross_entropy(
+                            outputs.logits.view(-1, vocab_size), 
+                            vy.view(-1), 
+                            reduction='sum'
+                        )
                     
-                    val_loss_accum += loss.item()
-                    val_count += 1
+                    total_val_loss += loss.item()
+                    total_val_tokens += vy.numel() # 累加当前批次的有效 token 数量
             
-            if val_count > 0:
-                avg_val_loss = val_loss_accum / val_count
-                val_ppl = math.exp(avg_val_loss)
+            if total_val_tokens > 0:
+                # 严谨的全局平均 Loss
+                avg_val_loss = total_val_loss / total_val_tokens
+                # 增加上限保护，防止训练早期极度发散时 math.exp 报错 (OverflowError)
+                val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else 1e9 
+                
                 print(f">>> VAL PPL: {val_ppl:.2f}")
+
+                wandb.log({
+                    "val/loss": avg_val_loss,
+                    "val/ppl": val_ppl,
+                    "step": step
+                })
+
                 log_file.write(f"VAL,{step},{avg_val_loss},{val_ppl}\n")
+                log_file.flush() # 加上 flush，确保验证日志能立刻写入文件，哪怕程序中断也不丢失
+                
             model.train()
 
     print("Saving model checkpoint...")
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "model.pt"))
+    model_path = os.path.join(args.output_dir, "model.pt")
+    torch.save(model.state_dict(), model_path)
+    # [新增] 告诉 wandb 保存这个模型文件，它会自动上传到云端
+    wandb.save(model_path, base_path=args.output_dir)
     print("Training Finished.")
     log_file.close()
+    
+    # [新增] 结束 wandb 记录
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

@@ -11,7 +11,8 @@
 # === 环境配置 ===
 export PYTHONPATH="$(pwd)/OLMo:$PYTHONPATH"
 PYTHON_BIN="/home/qijunrong/anaconda3/bin/python"
-SCRIPT="train_exp2_layerwise.py"
+export WANDB_MODE="offline"
+SCRIPT="train_exp2_wiki20-60.py"
 
 # === 路径配置 ===
 CHECKPOINT_ROOT="/data/qijunrong/03-proj/PE/checkpoints_variable_len"
