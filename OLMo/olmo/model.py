@@ -576,7 +576,7 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
         use_scaling = True
         
         # 获取阈值。关键修改：默认值设为 -1 (代表禁用层级策略，保持 Uniform)
-        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活 Bio-Gradient
+        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活HIPE
         scaling_threshold = getattr(config, "rope_scaling_threshold", -1)
         
         # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值 时，才强制关闭 Scaling

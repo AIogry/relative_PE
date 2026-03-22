@@ -8,6 +8,9 @@ import math
 import json
 import random
 import numpy as np
+import wandb
+import subprocess
+import sys
 from torch.amp import autocast
 from transformers import AutoTokenizer
 
@@ -22,6 +25,69 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def get_git_info():
+    """获取当前代码仓库的Git信息，返回字典"""
+    git_info = {}
+    try:
+        # 1. 获取完整commit hash（唯一标识代码版本）
+        git_info["commit_hash"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], 
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 2. 获取短commit hash（更易读）
+        git_info["short_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 3. 获取当前分支名
+        git_info["branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 4. 检查是否有未提交的修改（dirty/clean）
+        git_status = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        git_info["is_dirty"] = len(git_status) > 0
+        git_info["dirty_files"] = git_status if git_info["is_dirty"] else "None"
+        
+        # 5. 获取远程仓库地址（用于跳转到GitHub）
+        git_info["remote_url"] = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            stderr=subprocess.STDOUT
+        ).strip().decode("utf-8")
+        
+        # 6. 转换为GitHub网页链接（适配HTTPS/SSH格式）
+        if git_info["remote_url"].startswith("git@"):
+            git_info["github_commit_url"] = git_info["remote_url"].replace(
+                "git@github.com:", "https://github.com/"
+            ).replace(".git", "") + f"/commit/{git_info['commit_hash']}"
+        elif git_info["remote_url"].startswith("https"):
+            git_info["github_commit_url"] = git_info["remote_url"].replace(
+                ".git", ""
+            ) + f"/commit/{git_info['commit_hash']}"
+        else:
+            git_info["github_commit_url"] = "Unknown"
+            
+    except subprocess.CalledProcessError as e:
+        # Git命令执行失败（如非Git仓库、无权限）
+        git_info["error"] = f"Git command failed: {e.output.decode('utf-8')}"
+        git_info["commit_hash"] = "unknown"
+        git_info["short_commit"] = "unknown"
+    except Exception as e:
+        # 其他异常（如编码错误）
+        git_info["error"] = f"Get git info failed: {str(e)}"
+        git_info["commit_hash"] = "unknown"
+        git_info["short_commit"] = "unknown"
+    
+    return git_info
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -41,7 +107,7 @@ def main():
     parser.add_argument("--xpos", action="store_true") # XPos
     parser.add_argument("--rope_scale", type=float, default=None)
     
-    # === Bio-Gradient 参数 ===
+    # === HIPE 参数 ===
     parser.add_argument("--use_scaled_rope", action="store_true")
     parser.add_argument("--sigma", type=float, default=1.0)
     parser.add_argument("--rope_scaling_threshold", type=int, default=-1)
@@ -56,13 +122,43 @@ def main():
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_interval", type=int, default=100)
-    parser.add_argument("--eval_steps", type=int, default=20)
     
+    # === wandb参数设置 ===
+    parser.add_argument("--wandb_offline", type=str, default=None, help="Wandb mode")
+    parser.add_argument("--wandb_dir", type=str, default=None, help="Wandb offline tracking directory")
+
     args = parser.parse_args()
     set_seed(args.seed)
     
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+    git_info = get_git_info()
+    # 将Git短哈希加入tags，方便在wandb中快速筛选
+
+    run_tags = [args.model_size, f"len_{args.seq_len}", f"seed_{args.seed}"]  # 先初始化
+    run_tags.append(f"commit_{git_info['short_commit']}")  # 后追加
+    run_tags.append(f"dirty_{git_info['is_dirty']}" if "is_dirty" in git_info else "dirty_unknown")
+
+    if args.alibi or args.xpos or args.fope or args.nope or not args.use_scaled_rope:
+        run_group = "Exp2-wiki-Baselines"
+        run_tags.append("baseline")
+    else:
+        run_group = "Exp2-wiki-HIPE"
+        run_tags.append("hipe")
+        run_tags.append(f"sigma_{args.sigma}")
+
+    wandb.init(
+        project="Position Embedding",   # 替换为你的项目名称
+        group=run_group,
+        tags=run_tags,
+        name=args.run_id,             # 使用 bash 脚本中生成的精确 run_id 作为实验名
+        config=vars(args),            # 将所有 argparse 的参数自动保存到 wandb config 中
+        dir=args.output_dir          # 将本地日志也保存在 output_dir 下，方便管理
+    )
+
+    wandb.config.update(git_info)
 
     # 处理 Sigma List
     final_sigmas = None
@@ -74,11 +170,11 @@ def main():
 
     print(f"Loading Tokenizer from {args.local_tokenizer_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.local_tokenizer_path)
-    
     raw_vocab_size = tokenizer.vocab_size
     vocab_size = ((raw_vocab_size + 63) // 64) * 64
     print(f">>> Resizing Vocab: {raw_vocab_size} -> {vocab_size} (Aligned to 64)")
 
+    wandb.config.update({"actual_vocab_size": vocab_size})
     # =========================================================================
     # [优化] 数据预处理：一次性分词，不再在训练循环中分词
     # =========================================================================
@@ -233,7 +329,12 @@ def main():
 
     print(f"Model Params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     print(f"Experiment: {args.run_id} -> Saving to {args.output_dir}")
-    
+    print(f">>> Git Commit: {git_info['commit_hash']} (short: {git_info['short_commit']})")
+    print(f">>> Git Branch: {git_info.get('branch', 'unknown')}")
+    print(f">>> Code Dirty: {git_info.get('is_dirty', 'unknown')}")
+
+
+
     model.train()
     step = 0
     total_loss = 0.0 
@@ -243,6 +344,13 @@ def main():
     
     log_path = os.path.join(args.output_dir, "log.txt")
     log_file = open(log_path, "w")
+    log_file.write(f"Git Commit: {git_info['commit_hash']}\n")
+    log_file.write(f"Git Short Commit: {git_info['short_commit']}\n")
+    log_file.write(f"Git Branch: {git_info.get('branch', 'unknown')}\n")
+    log_file.write(f"Code Dirty: {git_info.get('is_dirty', 'unknown')}\n")
+    log_file.write(f"GitHub Commit URL: {git_info.get('github_commit_url', 'unknown')}\n")
+    log_file.write("Step,Loss,PPL\n")
+    log_file.flush()
 
     LOG_INTERVAL = 10 
 
@@ -276,43 +384,71 @@ def main():
             avg_loss = total_loss / LOG_INTERVAL
             ppl = math.exp(avg_loss) if avg_loss < 20 else 1e9
             lr = scheduler.get_last_lr()[0]
-            print(f"Step {step}/{total_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.2f} | LR: {lr:.2e}")
-            log_file.write(f"{step},{avg_loss},{ppl}\n")
+            print(f"Step {step}/{total_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.4f} | LR: {lr:.2e}")
+
+            wandb.log({
+                "train/loss": avg_loss,
+                "train/ppl": ppl,
+                "train/lr": lr,
+                "step": step
+            })
+
+            log_file.write(f"Step {step},Loss: {avg_loss:.4f},PPL: {ppl:.4f}\n")
             log_file.flush()
             total_loss = 0.0
 
         if step % args.eval_interval == 0:
             print(">>> Running Validation...")
             model.eval()
-            val_loss_accum = 0.0
-            val_count = 0
-            val_iter = iter(val_loader)
+            total_val_loss = 0.0
+            total_val_tokens = 0
+            
             with torch.no_grad():
-                for _ in range(args.eval_steps):
-                    try:
-                        vx, vy = next(val_iter)
-                    except StopIteration:
-                        break
+                # 直接遍历整个验证集，不再受 eval_steps 和 mbs 限制
+                for vx, vy in val_loader:
                     vx, vy = vx.to(device), vy.to(device)
                     
                     with autocast(device_type='cuda', dtype=torch.bfloat16):
                         outputs = model(input_ids=vx)
-                        loss = nn.functional.cross_entropy(outputs.logits.view(-1, vocab_size), vy.view(-1))
+                        # 注意：这里改为 reduction='sum'，计算当前批次所有 token 的 loss 总和
+                        loss = nn.functional.cross_entropy(
+                            outputs.logits.view(-1, vocab_size), 
+                            vy.view(-1), 
+                            reduction='sum'
+                        )
                     
-                    val_loss_accum += loss.item()
-                    val_count += 1
+                    total_val_loss += loss.item()
+                    total_val_tokens += vy.numel() # 累加当前批次的有效 token 数量
             
-            if val_count > 0:
-                avg_val_loss = val_loss_accum / val_count
-                val_ppl = math.exp(avg_val_loss)
-                print(f">>> VAL PPL: {val_ppl:.2f}")
+            if total_val_tokens > 0:
+                # 严谨的全局平均 Loss
+                avg_val_loss = total_val_loss / total_val_tokens
+                # 增加上限保护，防止训练早期极度发散时 math.exp 报错 (OverflowError)
+                val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else 1e9 
+                
+                print(f">>> VAL PPL: {val_ppl:.4f}")
+
+                wandb.log({
+                    "val/loss": avg_val_loss,
+                    "val/ppl": val_ppl,
+                    "step": step
+                })
+
                 log_file.write(f"VAL,{step},{avg_val_loss},{val_ppl}\n")
+                log_file.flush() # 加上 flush，确保验证日志能立刻写入文件，哪怕程序中断也不丢失
+                
             model.train()
 
     print("Saving model checkpoint...")
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "model.pt"))
+    model_path = os.path.join(args.output_dir, "model.pt")
+    torch.save(model.state_dict(), model_path)
+    # [新增] 告诉 wandb 保存这个模型文件，它会自动上传到云端
+    wandb.save(model_path, base_path=args.output_dir)
     print("Training Finished.")
     log_file.close()
+    
+    # [新增] 结束 wandb 记录
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

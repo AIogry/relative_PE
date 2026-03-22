@@ -1,6 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=exp2-300m-baselines
-#SBATCH --output=./logs/exp2_300m_baselines_%j.out
+
+#SBATCH --job-name=exp2-wiki300-base
+#SBATCH --output=/data/qijunrong/03-proj/PE/logs/exp2_wiki300/tmp_base_%j.out
+#SBATCH --error=/data/qijunrong/03-proj/PE/logs/exp2_wiki300/tmp_base_%j.err
 #SBATCH --partition=debug
 #SBATCH --gres=gpu:1
 #SBATCH --time=96:00:00
@@ -9,145 +11,114 @@
 
 # === 环境配置 ===
 export PYTHONPATH="$(pwd)/OLMo:$PYTHONPATH"
+export WANDB_MODE="offline"
 PYTHON_BIN="/home/qijunrong/anaconda3/bin/python"
-SCRIPT="train_exp2_wikifull.py"
+SCRIPT="train_exp2_wikifull.py" 
 
 # === 路径配置 ===
-CHECKPOINT_ROOT="/data/qijunrong/03-proj/PE/checkpoints_variable_len"
+ROOT_DIR="/data/qijunrong/03-proj/PE"
+LOG_DIR="${ROOT_DIR}/logs/exp2_wiki300/$(date +%Y%m%d)"
+CHECKPOINT_ROOT="${ROOT_DIR}/checkpoints_exp2/wiki300/base"
+WANDB_DIR="${ROOT_DIR}/wandb/offline/exp2_wiki300"
+
 LOCAL_DATA="/data/qijunrong/03-proj/PE/wikitext/raw"
 LOCAL_TOKENIZER="/data/qijunrong/03-proj/PE/wikitext/tokenizer"
 
-mkdir -p $CHECKPOINT_ROOT
-mkdir -p ./logs
+mkdir -p $LOG_DIR $CHECKPOINT_ROOT $WANDB_DIR
+
+JOB_ID=${SLURM_JOB_ID}
+FINAL_OUT="${LOG_DIR}/base_${JOB_ID}.out"
+FINAL_ERR="${LOG_DIR}/base_${JOB_ID}.err"
+
+exec > >(tee -a ${FINAL_OUT}) 2> >(tee -a ${FINAL_ERR} >&2)
+
+function cleanup {
+    rm -f /data/qijunrong/03-proj/PE/logs/exp2_wiki300/tmp_base_${JOB_ID}.out
+    rm -f /data/qijunrong/03-proj/PE/logs/exp2_wiki300/tmp_base_${JOB_ID}.err
+}
+trap cleanup EXIT
+
+echo ">>> Experiment started at $(date)"
+echo ">>> Log directory: ${LOG_DIR}"
+echo ">>> SLURM Job ID: ${JOB_ID}"
 
 # === 全局配置 ===
 GLOBAL_BS=64
 SEEDS=(6198 1024 7 568 3427)
-MAX_TOKENS=100000000 # 1亿 Token
+MAX_TOKENS=100000000
 
 # === DEBUG 配置 ===
-DEBUG_STEPS=""
-#DEBUG_STEPS=100  # <--- 取消注释开启调试
+DEBUG_STEPS="" 
+# DEBUG_STEPS=20
 
 if [ -n "$DEBUG_STEPS" ]; then
     echo ">>> [DEBUG MODE ENABLED] Steps: $DEBUG_STEPS"
-    # 300M 模型学习率统一调降至 3e-4
     LIMIT_ARGS="--max_train_steps $DEBUG_STEPS --lr 3e-4"
 else
     echo ">>> [FULL MODE] Max Tokens: $MAX_TOKENS"
     LIMIT_ARGS="--max_tokens $MAX_TOKENS --lr 3e-4"
 fi
 
-# ============================================================
-# 实验配置
-# ============================================================
 MODELS=("300M")
 LENGTHS=(512 1024 2048)
 
+# ============================================================
+# 核心函数1：计算Micro Batch Size (300M 专属)
+# ============================================================
 get_mbs() {
-    local seq_len=$1
-    # 300M 显存压力极大，基础 MBS 设为 8
-    local mbs=8
-    if [ "$seq_len" -ge 2048 ]; then mbs=4; fi
+    local m_size=$1
+    local seq_len=$2
+    local baseline_type=$3
+    
+    local mbs=16
+    if [ "$seq_len" -ge 2048 ]; then mbs=8; fi      # 普通的都可以运行
+
+    if [ "$baseline_type" == "alibi" ]; then
+        mbs=$((mbs / 2)); # ablibi-1024的mbs=4可以运行，alibi-512的mbs=8可以运行
+        if [ "$seq_len" -ge 1024 ]; then mbs=1; fi   # alibi-2048的mbs=2不能运行
+    fi
+
     echo $mbs
 }
 
 # ============================================================
-# 1. Baseline: Standard RoPE
+# 核心函数2：统一运行Baseline实验
 # ============================================================
-echo ">>> [BATCH START] Running Standard RoPE..."
-for SEED in "${SEEDS[@]}"; do
-    for M_SIZE in "${MODELS[@]}"; do
-        for SEQ_LEN in "${LENGTHS[@]}"; do
-            CUR_MICRO_BS=$(get_mbs $SEQ_LEN)
-            RUN_ID="baseline_rope_${M_SIZE}_L${SEQ_LEN}"
-            if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-            
-            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
-
-            echo ">>> [RoPE] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
-            $PYTHON_BIN $SCRIPT \
-                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-                $LIMIT_ARGS --seed $SEED
+run_baseline_experiment() {
+    local baseline_type=$1
+    local extra_args=$2
+    
+    echo -e "\n>>> [BATCH START] Running $baseline_type..."
+    
+    for SEED in "${SEEDS[@]}"; do
+        for M_SIZE in "${MODELS[@]}"; do
+            for SEQ_LEN in "${LENGTHS[@]}"; do
+                CUR_MICRO_BS=$(get_mbs $M_SIZE $SEQ_LEN $baseline_type)
+                RUN_ID="baseline_${baseline_type}_${M_SIZE}_L${SEQ_LEN}"
+                OUTPUT_DIR="${CHECKPOINT_ROOT}/${M_SIZE}/${RUN_ID}/seed_${SEED}"
+                
+                echo ">>> [$baseline_type] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
+                
+                $PYTHON_BIN $SCRIPT \
+                    --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
+                    --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
+                    --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
+                    --wandb_dir $WANDB_DIR --wandb_mode $WANDB_MODE \
+                    $extra_args \
+                    $LIMIT_ARGS --seed $SEED
+                
+                if [ $? -ne 0 ]; then
+                    echo ">>> [ERROR] $baseline_type实验失败！Model: $M_SIZE, Len: $SEQ_LEN, SEED: $SEED"
+                fi
+            done
         done
     done
-done
+}
 
-# ============================================================
-# 2. Baseline: NoPE (No Positional Encoding)
-# ============================================================
-echo ">>> [BATCH START] Running NoPE..."
-for SEED in "${SEEDS[@]}"; do
-    for M_SIZE in "${MODELS[@]}"; do
-        for SEQ_LEN in "${LENGTHS[@]}"; do
-            CUR_MICRO_BS=$(get_mbs $SEQ_LEN)
-            RUN_ID="baseline_nope_${M_SIZE}_L${SEQ_LEN}"
-            if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-            
-            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
 
-            echo ">>> [NoPE] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
-            $PYTHON_BIN $SCRIPT \
-                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-                --nope \
-                $LIMIT_ARGS --seed $SEED
-        done
-    done
-done
+run_baseline_experiment "rope" ""
+run_baseline_experiment "xpos" "--xpos"
+run_baseline_experiment "nope" "--nope"
+run_baseline_experiment "alibi" "--alibi"
 
-# ============================================================
-# 3. Baseline: XPos
-# ============================================================
-echo ">>> [BATCH START] Running XPos..."
-for SEED in "${SEEDS[@]}"; do
-    for M_SIZE in "${MODELS[@]}"; do
-        for SEQ_LEN in "${LENGTHS[@]}"; do
-            CUR_MICRO_BS=$(get_mbs $SEQ_LEN)
-            RUN_ID="baseline_xpos_${M_SIZE}_L${SEQ_LEN}"
-            if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-            
-            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
-
-            echo ">>> [XPos] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
-            $PYTHON_BIN $SCRIPT \
-                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-                --xpos \
-                $LIMIT_ARGS --seed $SEED
-        done
-    done
-done
-
-# ============================================================
-# 4. Baseline: ALiBi
-# ============================================================
-echo ">>> [BATCH START] Running ALiBi..."
-for SEED in "${SEEDS[@]}"; do
-    for M_SIZE in "${MODELS[@]}"; do
-        for SEQ_LEN in "${LENGTHS[@]}"; do
-            
-            # ALiBi 关了 FlashAttention，极其吃显存，MBS 强制设为 1 或更低
-            CUR_MICRO_BS=1
-
-            RUN_ID="baseline_alibi_${M_SIZE}_L${SEQ_LEN}"
-            if [ -n "$DEBUG_STEPS" ]; then RUN_ID="${RUN_ID}_debug"; fi
-            
-            OUTPUT_DIR="$CHECKPOINT_ROOT/${RUN_ID}"
-
-            echo ">>> [ALiBi] Model: $M_SIZE | Len: $SEQ_LEN | MBS: $CUR_MICRO_BS | SEED: $SEED"
-            $PYTHON_BIN $SCRIPT \
-                --output_dir $OUTPUT_DIR --run_id $RUN_ID --model_size $M_SIZE \
-                --local_data_path $LOCAL_DATA --local_tokenizer_path $LOCAL_TOKENIZER \
-                --seq_len $SEQ_LEN --global_batch_size $GLOBAL_BS --micro_batch_size $CUR_MICRO_BS \
-                --alibi \
-                $LIMIT_ARGS --seed $SEED
-        done
-    done
-done
-
-echo ">>> All 300M Baselines Completed."
+echo -e "\n>>> All 300M Baselines Completed."
