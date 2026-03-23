@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=96:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=80G
+#SBATCH --mem=100G
 
 # === 环境配置 ===
 export PYTHONPATH="$(pwd)/OLMo:$PYTHONPATH"
@@ -46,10 +46,10 @@ echo ">>> SLURM Job ID: ${JOB_ID}"
 # === 全局配置 ===
 GLOBAL_BS=64
 SEEDS=(6198)    # 先只测试一个seed
-MAX_TOKENS=7000000000 # C4 使用 7B Token
+MAX_TOKENS=1000000000 # C4 使用 1B Token
 
 # C4 数据量控制
-TRAIN_SAMPLES=10000000      # 10M samples
+TRAIN_SAMPLES=5000000      # 10M samples
 VAL_SAMPLES=10000
 
 # === DEBUG 配置 ===
@@ -65,8 +65,8 @@ else
 fi
 
 # 参数空间 (300M 专属)
-SIGMAS=(50.0 100.0 200.0 500.0 700.0 1000.0)
-THRESHOLDS=(3 5 7 9 11 13)
+SIGMAS=(700.0)  # (50.0 100.0 200.0 500.0 700.0 1000.0)
+THRESHOLDS=(7 9) # (3 5 7 9 11 13)
 MODELS=("300M")
 LENGTHS=(512 1024 2048)
 

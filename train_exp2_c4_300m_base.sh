@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=96:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=80G
+#SBATCH --mem=100G
 
 # === 环境配置 ===
 export PYTHONPATH="$(pwd)/OLMo:$PYTHONPATH"
@@ -47,8 +47,8 @@ GLOBAL_BS=64
 SEEDS=(6198) # 1024 7 568 3427)
 
 # C4 专享大数据量配置
-MAX_TOKENS=7000000000 # 7B token
-TRAIN_SAMPLES=10000000 # 10M samples
+MAX_TOKENS=1000000000 # 1B token
+TRAIN_SAMPLES=5000000 # 10M samples
 VAL_SAMPLES=10000
 
 # === DEBUG 配置 ===

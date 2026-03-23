@@ -25,6 +25,7 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
 def get_git_info():
     """获取当前代码仓库的Git信息，返回字典"""
     git_info = {}
@@ -33,24 +34,29 @@ def get_git_info():
             ["git", "rev-parse", "HEAD"], 
             stderr=subprocess.STDOUT
         ).strip().decode("utf-8")
+        
         git_info["short_commit"] = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
             stderr=subprocess.STDOUT
         ).strip().decode("utf-8")
+        
         git_info["branch"] = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             stderr=subprocess.STDOUT
         ).strip().decode("utf-8")
+        
         git_status = subprocess.check_output(
             ["git", "status", "--porcelain"],
             stderr=subprocess.STDOUT
         ).strip().decode("utf-8")
         git_info["is_dirty"] = len(git_status) > 0
         git_info["dirty_files"] = git_status if git_info["is_dirty"] else "None"
+        
         git_info["remote_url"] = subprocess.check_output(
             ["git", "remote", "get-url", "origin"],
             stderr=subprocess.STDOUT
         ).strip().decode("utf-8")
+        
         if git_info["remote_url"].startswith("git@"):
             git_info["github_commit_url"] = git_info["remote_url"].replace(
                 "git@github.com:", "https://github.com/"
@@ -61,6 +67,7 @@ def get_git_info():
             ) + f"/commit/{git_info['commit_hash']}"
         else:
             git_info["github_commit_url"] = "Unknown"
+            
     except subprocess.CalledProcessError as e:
         git_info["error"] = f"Git command failed: {e.output.decode('utf-8')}"
         git_info["commit_hash"] = "unknown"
@@ -78,7 +85,7 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--run_id", type=str, required=True)
     
-    # === [修改点 1] 将 local_data_path 替换为 C4 专属的 dataset_path 及采样参数 ===
+    # === 将 local_data_path 替换为 C4 专属的 dataset_path 及采样参数 ===
     parser.add_argument("--dataset_path", type=str, required=True, help="Path containing c4_30M_train/val")
     parser.add_argument("--train_size", type=int, default=5000000)
     parser.add_argument("--val_size", type=int, default=10000)
@@ -122,17 +129,19 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    git_info = get_git_info()
 
-    run_tags = [args.model_size, f"len_{args.seq_len}", f"seed_{args.seed}"]
-    run_tags.append(f"commit_{git_info['short_commit']}")
+    git_info = get_git_info()
+    # 将Git短哈希加入tags，方便在wandb中快速筛选
+
+    run_tags = [args.model_size, f"len_{args.seq_len}", f"seed_{args.seed}"]  # 先初始化
+    run_tags.append(f"commit_{git_info['short_commit']}")  # 后追加
     run_tags.append(f"dirty_{git_info['is_dirty']}" if "is_dirty" in git_info else "dirty_unknown")
 
     if args.alibi or args.xpos or args.fope or args.nope or not args.use_scaled_rope:
-        run_group = "Exp2-C4-Baselines"  # [修改] 组名变更为 C4
+        run_group = "Exp2-C4-Baselines"
         run_tags.append("baseline")
     else:
-        run_group = "Exp2-C4-HIPE"       # [修改] 组名变更为 C4
+        run_group = "Exp2-C4-HIPE"
         run_tags.append("hipe")
         run_tags.append(f"sigma_{args.sigma}")
 
@@ -151,6 +160,7 @@ def main():
 
     wandb.config.update(git_info)
 
+    # 处理 Sigma List
     final_sigmas = None
     if args.sigma_list is not None:
         final_sigmas = []
@@ -158,7 +168,7 @@ def main():
             if s == "None": final_sigmas.append(None)
             else: final_sigmas.append(float(s))
 
-    # === [修改点 2] Tokenizer 加载 (引入 Fallback 容错) ===
+    # === Tokenizer 加载 (引入 Fallback 容错) ===
     print(f"Loading Tokenizer from {args.local_tokenizer_path}...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.local_tokenizer_path, local_files_only=True)
@@ -173,7 +183,7 @@ def main():
     wandb.config.update({"actual_vocab_size": vocab_size})
 
     # =========================================================================
-    # [修改点 3] C4 专属数据预处理：支持 train/val 独立读取与 select 截断
+    # C4 专属数据预处理：支持 train/val 独立读取与 select 截断
     # =========================================================================
     print(f"Loading C4 Data from: {args.dataset_path}")
     train_path = os.path.join(args.dataset_path, "c4_30M_train")
@@ -196,9 +206,13 @@ def main():
     def tokenize_function(examples):
         return tokenizer(examples["text"], truncation=False)
 
-    # 训练集和验证集分开 Map
-    tokenized_train = train_ds.map(tokenize_function, batched=True, remove_columns=["text"], num_proc=8, desc="Tokenizing Train")
-    tokenized_val = val_ds.map(tokenize_function, batched=True, remove_columns=["text"], num_proc=8, desc="Tokenizing Val")
+    # [修复点] 获取原始数据集的所有列名 (不仅是 'text'，还包括 'url', 'timestamp' 等)
+    train_cols = train_ds.column_names
+    val_cols = val_ds.column_names
+
+    # 训练集和验证集分开 Map，并彻底移除所有原始列
+    tokenized_train = train_ds.map(tokenize_function, batched=True, remove_columns=train_cols, num_proc=8, desc="Tokenizing Train")
+    tokenized_val = val_ds.map(tokenize_function, batched=True, remove_columns=val_cols, num_proc=8, desc="Tokenizing Val")
 
     block_size = args.seq_len + 1
 
