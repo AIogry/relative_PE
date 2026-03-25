@@ -118,6 +118,7 @@ def main():
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=1000, help="每多少步保存一次模型权重")
     
     # === wandb参数设置 ===
     parser.add_argument("--wandb_mode", type=str, default="offline", help="Wandb mode")
@@ -381,6 +382,16 @@ def main():
         total_loss += current_step_loss
         step += 1
         
+        if step % args.save_interval == 0:
+            ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            save_path = os.path.join(ckpt_dir, f"model_step_{step}.pt")
+            
+            # 推荐只保存 state_dict 以节省空间
+            torch.save(model.state_dict(), save_path)
+            print(f">>> Checkpoint saved at step {step}: {save_path}")
+
+
         if step % LOG_INTERVAL == 0:
             avg_loss = total_loss / LOG_INTERVAL
             ppl = math.exp(avg_loss) if avg_loss < 20 else 1e9

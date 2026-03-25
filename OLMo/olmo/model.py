@@ -554,7 +554,84 @@ class GridEmbedding(RotaryEmbedding):
     
 
 
-class ScaledRotaryEmbedding(RotaryEmbedding):
+class ScaledRotaryEmbedding(RotaryEmbedding):   # 增加了动态外推频率函数
+    """
+    Scaled RoPE with Optional Layer-wise Control.
+    """
+    def __init__(self, config: ModelConfig, cache: BufferCache, sigma: float = 1.0, layer_index: Optional[int] = None):
+        super().__init__(config, cache)
+        
+        # 保存这些属性，以便后续动态重算时使用
+        self._sigma_input = sigma
+        self._layer_index = layer_index
+        
+        # 初次计算 Scale Factor
+        self._update_scale_factor(_non_meta_init_device(config))
+
+    # [新增修改]：提取出独立的更新函数，解决动态外推时的频率错位问题
+    def _update_scale_factor(self, device: torch.device):
+        use_scaling = True
+        scaling_threshold = getattr(self.config, "rope_scaling_threshold", -1)
+        
+        if scaling_threshold >= 0 and self._layer_index is not None:
+            if self._layer_index <= scaling_threshold:
+                use_scaling = False
+
+        dim = self.config.d_model // self.config.n_heads
+        
+        if not use_scaling:
+            scale_full = torch.ones(self.config.n_heads, dim, device=device)
+            # 动态更新 buffer
+            if hasattr(self, 'scale_factor'):
+                self.scale_factor.copy_(scale_full)
+            else:
+                self.register_buffer('scale_factor', scale_full)
+            return 
+
+        if isinstance(self._sigma_input, float):
+            sigmas = [self._sigma_input] * self.config.n_heads
+        else:
+            sigmas = self._sigma_input
+            
+        with torch.no_grad():
+            # 关键：这里获取的是当前最新的 inv_freq（可能已经被 YaRN 压缩过）
+            inv_freq = self.get_inv_freq(device) 
+            
+            sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
+            freqs = inv_freq.view(1, -1) 
+            
+            decay_func = getattr(self.config, 'decay_func', 'gaussian')
+            
+            if decay_func == 'gaussian':
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+            elif decay_func == 'exp':
+                scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + freqs**2) * freqs
+            elif decay_func == 'power':
+                scale = torch.exp(-sigmas_tensor * freqs) * freqs
+            elif decay_func == 'segmented':
+                order = getattr(self.config, 'decay_order', 8)
+                scale = (1.0 / (1.0 + (sigmas_tensor * freqs) ** order)) * freqs
+            else:
+                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+            
+            scale = torch.sqrt(scale)
+            scale_full = torch.cat((scale, scale), dim=-1)
+
+            correction_factor = torch.rsqrt(torch.mean(scale_full**2))
+            scale_full = scale_full * correction_factor
+
+            # 动态更新 buffer
+            if hasattr(self, 'scale_factor'):
+                self.scale_factor.copy_(scale_full)
+            else:
+                self.register_buffer('scale_factor', scale_full)
+
+    def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
+
+
+class ScaledRotaryEmbedding1(RotaryEmbedding):      # yarn+HIPE之前的代码
     """
     Scaled RoPE with Optional Layer-wise Control.
     Modes:
