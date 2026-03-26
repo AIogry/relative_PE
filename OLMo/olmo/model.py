@@ -556,93 +556,190 @@ class GridEmbedding(RotaryEmbedding):
 
 class ScaledRotaryEmbedding(RotaryEmbedding):
     """
-    Scaled RoPE with Optional Layer-wise Control.
-    Modes:
-    1. Uniform Scaling: All layers use the same sigma (if threshold < 0).
-    2. Bio-Gradient: Shallow layers use Standard RoPE, Deep layers use Scaled RoPE (if threshold >= 0).
+    带缩放的旋转位置编码（Scaled RoPE），支持分层控制与可学习缩放系数
+    工作模式：
+    1. 均匀缩放：所有层使用相同的sigma（当阈值 < 0 时生效）
+    2. 生物梯度模式：浅层使用标准RoPE，深层使用缩放RoPE（当阈值 >= 0 时生效）
+    3. 可学习sigma：若配置中learnable_sigma=True，sigma将成为可学习参数
     """
-
+ 
     def __init__(self, config: ModelConfig, cache: BufferCache, sigma: float = 1.0, layer_index: Optional[int] = None):
         """
+        初始化缩放旋转位置编码
         Args:
-            sigma (float): The scaling factor.
-            layer_index (int, optional): The current layer index.
+            config: 模型配置对象
+            cache: 缓冲区缓存
+            sigma: 缩放系数初始值
+            layer_index: 当前层索引（用于分层控制）
         """
         super().__init__(config, cache)
+        # --- 1. 更健壮的层级控制逻辑 ---
         
-        # --- 1. 更加健壮的层级控制逻辑 ---
+        # 默认行为：启用缩放（默认全局应用Sigma缩放）
+        self.use_scaling = True
         
-        # 默认行为：启用 Scaling (即假设我们想要全层应用 Sigma)
-        use_scaling = True
-        
-        # 获取阈值。关键修改：默认值设为 -1 (代表禁用层级策略，保持 Uniform)
-        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活HIPE
+        # 获取缩放阈值，关键修改：默认值设为-1（代表禁用分层策略，保持均匀缩放）
+        # 仅当在config中显式设置rope_scaling_threshold >= 0时，才会激活分层模式
         scaling_threshold = getattr(config, "rope_scaling_threshold", -1)
         
-        # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值 时，才强制关闭 Scaling
+        # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值时，强制关闭缩放
         if scaling_threshold >= 0 and layer_index is not None:
             if layer_index <= scaling_threshold:
-                use_scaling = False
-                print(f"Layer {layer_index}: Scaling DISABLED (Gradient Mode)")
+                self.use_scaling = False
+                print(f"Layer {layer_index}: 缩放已禁用（梯度模式）")
         
-        # 否则，use_scaling 保持为 True，即执行原来的逻辑（全层使用传入的 sigma）
+        # 否则，use_scaling保持为True，执行原有逻辑（全局使用传入的sigma）
         
         # --------------------------------
-
-        # 获取维度信息
+ 
+        # --- 2. 核心修改：定义可学习的Sigma参数 ---
+        self.is_learnable = getattr(config, "learnable_sigma", False)
+ 
+        # 获取注意力头维度信息
         dim = self.config.d_model // self.config.n_heads
         
-        # --- 2. 如果不启用 Scaling (即退化为 Standard RoPE) ---
-        # 这是针对需要layer分布的前几层，前几层需要使用原始的RoPE
-        if not use_scaling:
+        # --- 3. 如果不启用缩放（退化回标准RoPE）---
+        # 针对分层策略中的前几层，强制使用原始RoPE编码
+        if not self.use_scaling:
             scale_full = torch.ones(self.config.n_heads, dim)
             self.register_buffer('scale_factor', scale_full)
             return 
-
-        # --- 3. 如果启用 Scaling (应用 Sigma) ---
-        
-        if isinstance(sigma, float):
-            sigmas = [sigma] * self.config.n_heads
+ 
+        # --- 4. 如果启用缩放（应用Sigma）---
+        if self.is_learnable:
+            # 策略：为每个注意力头初始化独立的可学习Sigma参数
+            # 初始值统一设置为传入的sigma
+            initial_sigmas = torch.ones(self.config.n_heads) * sigma
+            self.sigma_param = nn.Parameter(initial_sigmas)
+            print(f"Layer {layer_index if layer_index is not None else '?'}: Sigma为可学习参数（按头独立）")
         else:
-            sigmas = sigma
-            
-        if len(sigmas) != self.config.n_heads:
-             raise ValueError(f"Sigma count ({len(sigmas)}) must match head count ({self.config.n_heads})")
-
-        with torch.no_grad():
-            device = _non_meta_init_device(config)
-            inv_freq = self.get_inv_freq(device) 
-            
-            sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
-            freqs = inv_freq.view(1, -1) 
-            
-            decay_func = getattr(self.config, 'decay_func', 'gaussian')
-            
-            if decay_func == 'gaussian':
-                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
-            elif decay_func == 'exp':
-                scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + freqs**2) * freqs
-            elif decay_func == 'power':
-                scale = torch.exp(-sigmas_tensor * freqs) * freqs
-            elif decay_func == 'segmented':
-                order = getattr(self.config, 'decay_order', 8)
-                scale = (1.0 / (1.0 + (sigmas_tensor * freqs) ** order)) * freqs
+            # 回退到原有逻辑，仅注册不可学习的静态张量
+            if isinstance(sigma, float):
+                sigmas = [sigma] * self.config.n_heads
             else:
-                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
-            
-            scale = torch.sqrt(scale)
-            scale_full = torch.cat((scale, scale), dim=-1)
-
-            correction_factor = torch.rsqrt(torch.mean(scale_full**2))
-            scale_full = scale_full * correction_factor
-
-            self.register_buffer('scale_factor', scale_full)
-
+                sigmas = sigma
+                
+            if len(sigmas) != self.config.n_heads:
+                raise ValueError(f"Sigma数量({len(sigmas)})必须与头数量({self.config.n_heads})匹配")
+                
+            with torch.no_grad():
+                device = _non_meta_init_device(config)
+                inv_freq = self.get_inv_freq(device) 
+                
+                sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
+                freqs = inv_freq.view(1, -1) 
+                
+                decay_func = getattr(self.config, 'decay_func', 'gaussian')
+                
+                if decay_func == 'gaussian':
+                    scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+                elif decay_func == 'exp':
+                    scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + freqs**2) * freqs
+                elif decay_func == 'power':
+                    scale = torch.exp(-sigmas_tensor * freqs) * freqs
+                elif decay_func == 'segmented':
+                    order = getattr(self.config, 'decay_order', 8)
+                    scale = (1.0 / (1.0 + (sigmas_tensor * freqs) ** order)) * freqs
+                else:
+                    scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+                
+                scale = torch.sqrt(scale)
+                scale_full = torch.cat((scale, scale), dim=-1)
+ 
+                correction_factor = torch.rsqrt(torch.mean(scale_full**2))
+                scale_full = scale_full * correction_factor
+ 
+                self.register_buffer('scale_factor', scale_full)
+ 
+    def _get_scale_factor(self, device: torch.device) -> torch.Tensor:
+        """
+        动态计算当前的缩放因子
+        由于sigma可能是可学习的，因此在前向传播时必须实时计算，保证计算图和梯度的连通性
+        Args:
+            device: 计算设备
+        Returns:
+            动态计算的缩放因子张量
+        """
+        if not self.use_scaling:
+            # 如果不使用缩放，直接返回全1张量
+            dim = self.config.d_model // self.config.n_heads
+            return torch.ones(1, self.config.n_heads, 1, dim, device=device)
+ 
+        # 获取当前的sigma（保证梯度连通）
+        if self.is_learnable:
+            # 强制sigma大于0.001，防止学习到负数或0导致分母爆炸
+            current_sigmas = torch.clamp(self.sigma_param, min=1e-3).to(device)
+        else:
+            # 获取静态的sigma值
+            dim = self.config.d_model // self.config.n_heads
+            return self.scale_factor.view(1, self.config.n_heads, 1, dim).to(device)
+ 
+        current_sigmas = current_sigmas.view(self.config.n_heads, 1)
+        
+        # 获取频率系数
+        inv_freq = self.get_inv_freq(device) 
+        freqs = inv_freq.view(1, -1) 
+        
+        decay_func = getattr(self.config, 'decay_func', 'gaussian')
+        
+        # 根据当前的Sigma动态计算衰减幅度
+        if decay_func == 'gaussian':
+            scale = torch.exp(-current_sigmas**2 * freqs**2 / 2) * freqs
+        elif decay_func == 'exp':
+            scale = (1/current_sigmas)**2 / ((1/current_sigmas)**2 + freqs**2) * freqs
+        elif decay_func == 'power':
+            scale = torch.exp(-current_sigmas * freqs) * freqs
+        elif decay_func == 'segmented':
+            order = getattr(self.config, 'decay_order', 8)
+            scale = (1.0 / (1.0 + (current_sigmas * freqs) ** order)) * freqs
+        else:
+            scale = torch.exp(-current_sigmas**2 * freqs**2 / 2) * freqs
+        
+        scale = torch.clamp(scale, min=1e-10)
+        scale = torch.sqrt(scale)
+        scale_full = torch.cat((scale, scale), dim=-1)
+ 
+        # RMS修正因子（同样需要动态计算，保证能量守恒）
+        correction_factor = torch.rsqrt(torch.mean(scale_full**2, dim=-1, keepdim=True))
+        mean_square = torch.mean(scale_full**2, dim=-1, keepdim=True)
+        # 避免除零错误和NaN值
+        mean_square = torch.clamp(mean_square, min=1e-10)
+        correction_factor = torch.rsqrt(mean_square)
+        scale_full = scale_full * correction_factor
+        scale_full = torch.nan_to_num(scale_full, nan=1.0, posinf=1.0, neginf=1.0)
+        # 调整形状为 [1, n_heads, 1, hs] 方便广播
+        return scale_full.view(1, self.config.n_heads, 1, -1)
+ 
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        """
+        重写RoPE应用方法：每次应用时动态获取并乘上当前的缩放因子
+        Args:
+            pos_sin: 位置编码sin值
+            pos_cos: 位置编码cos值
+            t: 待编码的张量
+        Returns:
+            应用缩放+旋转位置编码后的张量
+        """
+        # 1. 动态获取带有梯度计算图的缩放因子
+        current_scale_factor = self._get_scale_factor(t.device)
+        
+        # 2. 对输入的token维度进行幅度缩放
+        t_scaled = t * current_scale_factor
+        
+        # 3. 调用父类（标准RoPE）的旋转逻辑
         return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
-    
-
+ 
+    def get_sigma_values(self) -> torch.Tensor:
+        """
+        获取当前的sigma值，用于监控训练过程
+        Returns:
+            裁剪后的sigma张量（可学习）/ None（不可学习）
+        """
+        if self.is_learnable:
+            return torch.clamp(self.sigma_param, min=1e-3)
+        else:
+            # 非可学习模式返回None
+            return None
 
 
 class ScaledRotaryEmbedding0(RotaryEmbedding):

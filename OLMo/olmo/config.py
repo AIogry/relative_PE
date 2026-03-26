@@ -398,6 +398,10 @@ class ModelConfig(BaseConfig):
     from which layer set sigma
     """
 
+    learnable_sigma: bool = False
+    """
+    If ``True``, the sigma value is learnable.
+    """
 
 
 
