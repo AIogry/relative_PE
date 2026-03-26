@@ -12,6 +12,7 @@
 # === 环境配置 ===
 export PYTHONPATH="$(pwd)/OLMo:$PYTHONPATH"
 export WANDB_MODE="offline"
+export PYTHONUNBUFFERED=1
 PYTHON_BIN="/home/qijunrong/anaconda3/bin/python"
 SCRIPT="train_exp2_c4full_extrap.py" 
 
@@ -58,7 +59,7 @@ EXTRAP_INTERVAL=2000
 
 # === DEBUG 配置 ===
 DEBUG_STEPS="" 
-# DEBUG_STEPS=200
+#DEBUG_STEPS=30
 if [ -n "$DEBUG_STEPS" ]; then
     echo ">>> [DEBUG MODE ENABLED] Steps: $DEBUG_STEPS"
     LIMIT_ARGS="--max_train_steps $DEBUG_STEPS --lr 3e-4"

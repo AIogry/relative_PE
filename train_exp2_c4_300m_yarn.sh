@@ -12,6 +12,7 @@
 # === 环境配置 ===
 export PYTHONPATH="$(pwd)/OLMo:$PYTHONPATH"
 export WANDB_MODE="offline"
+export PYTHONUNBUFFERED=1
 PYTHON_BIN="/home/qijunrong/anaconda3/bin/python"
 SCRIPT="train_exp2_c4full.py" 
 

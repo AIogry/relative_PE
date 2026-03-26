@@ -53,7 +53,7 @@ VAL_SAMPLES=10000
 
 # === DEBUG 配置 ===
 DEBUG_STEPS="" 
-# DEBUG_STEPS=20
+# DEBUG_STEPS=200
 
 if [ -n "$DEBUG_STEPS" ]; then
     echo ">>> [DEBUG MODE ENABLED] Steps: $DEBUG_STEPS"

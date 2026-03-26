@@ -1731,9 +1731,10 @@ class OLMoBlock(nn.Module):
         # ✅ NEW: Diagonal Modulated PE
         # ----------------------------
         if getattr(self.config, 'use_diag_pe', False):
+            # ... (这部分保持你原来上传代码的原样，不要动) ...
             # We do NOT use FlashAttention or SDPA — compute scores manually
             assert max_doc_len is None and cu_doc_lens is None, "Document masking not supported in DMPE yet"
-
+            
             # Expand k/v heads if needed (GQA)
             num_kv_heads = k.size(1)
             num_q_heads = q.size(1)
@@ -1743,8 +1744,6 @@ class OLMoBlock(nn.Module):
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
 
             # Compute cos((m - n) * theta_d) for all (m,n,d)
-            # Note: q corresponds to positions [offset_k, offset_k + T_q)
-            #       k corresponds to positions [0, T_k)
             cos_mod = self.pos_enc.compute_cos_modulation(
                 seq_len_q=T_q,
                 seq_len_k=T_k,
@@ -1754,40 +1753,29 @@ class OLMoBlock(nn.Module):
                 offset_k=0,
             )  # (T_q, T_k, D_full)
 
-            # But q,k are per-head, with head_dim = D_full / n_heads
             head_dim = q.size(-1)
-            # Repeat cos_mod for each head (same modulation across heads)
             cos_mod = cos_mod.unsqueeze(0).unsqueeze(0)  # (1, 1, T_q, T_k, D_full)
             cos_mod = cos_mod.view(1, 1, T_q, T_k, self.config.n_heads, head_dim)  # (1,1,Tq,Tk,nh,hd)
             cos_mod = cos_mod.permute(0, 4, 2, 3, 1, 5)  # (1, nh, Tq, Tk, 1, hd)
             cos_mod = cos_mod.squeeze(-2)  # (1, nh, Tq, Tk, hd)
 
-            # Compute q_d * k_d for all (b, h, i, j, d)
             q_exp = q.unsqueeze(3)  # (B, nh, T_q, 1, hd)
             k_exp = k.unsqueeze(2)  # (B, nh, 1, T_k, hd)
             qk_prod = q_exp * k_exp  # (B, nh, T_q, T_k, hd)
 
-            # Apply modulation and sum over d
             scores = torch.sum(qk_prod * cos_mod, dim=-1)  # (B, nh, T_q, T_k)
-
-            # Scale by 1/sqrt(d)
             scores = scores / math.sqrt(head_dim)
 
-            # Apply attention bias (if any)
             if attention_bias is not None:
-                # attention_bias: (B, nh, T_total, T_total)
-                # We need slice: [..., offset_k:offset_k+T_q, :T_k]
                 bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
                 scores = scores + self._cast_attn_bias(bias_slice, dtype)
 
-            # Apply causal mask if no attention_bias
             if attention_bias is None:
                 causal_mask = torch.triu(
                     torch.full_like(scores, float("-inf")), diagonal=1 + (T_k - T_q)
                 )
                 scores = scores + causal_mask
 
-            # Softmax + dropout
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = F.dropout(
                 attn_weights,
@@ -1795,7 +1783,6 @@ class OLMoBlock(nn.Module):
                 training=self.training,
             )
 
-            # Compute output: (B, nh, T_q, T_k) @ (B, nh, T_k, hd) -> (B, nh, T_q, hd)
             att = torch.matmul(attn_weights, v)
 
         else:
@@ -1805,15 +1792,57 @@ class OLMoBlock(nn.Module):
             if hasattr(self, 'rotary_emb') and self.rotary_emb is not None:
                 q, k = self.rotary_emb(q, k)
 
-            if attention_bias is not None:
-                bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
-                attention_bias = self._cast_attn_bias(bias_slice, dtype)
+            # =========================================================
+            # ✅ 新增：Local Attention 掩码构造逻辑
+            # =========================================================
+            # 获取 config 中传递的窗口大小和局部层数量
+            local_window = getattr(self.config, "local_window_size", -1)
+            num_local_layers = getattr(self.config, "num_local_layers", 0)
+            
+            # 判断当前层是否需要使用局部注意力
+            is_local_layer = (local_window > 0) and (self.layer_id < num_local_layers)
 
+            if is_local_layer:
+                # 生成序列的绝对位置索引
+                q_idx = torch.arange(T_q, device=q.device).view(-1, 1)
+                k_idx = torch.arange(T_k, device=k.device).view(1, -1)
+                
+                # 1. 距离掩码 (Distance Mask): 当前 Query 位置减去 Key 位置必须小于窗口大小
+                dist_mask = (q_idx + offset_k - k_idx) < local_window
+                
+                # 2. 因果掩码 (Causal Mask): Key 不能看未来
+                causal_mask = k_idx <= (q_idx + offset_k)
+                
+                # 3. 最终有效区域
+                valid_mask = dist_mask & causal_mask
+
+                # 4. 构造 Float 类型的 Bias
+                local_bias = torch.zeros(1, 1, T_q, T_k, device=q.device, dtype=dtype)
+                # 将无效区域（False）填充为负无穷，在 Softmax 后变为 0
+                local_bias.masked_fill_(~valid_mask, torch.finfo(dtype).min)
+
+                if attention_bias is not None:
+                    # 如果原先存在 attention_bias (如 ALiBi)，将两者相加
+                    bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
+                    bias_slice = self._cast_attn_bias(bias_slice, dtype)
+                    attention_bias = bias_slice + local_bias
+                else:
+                    # 否则直接使用自定义的 local_bias
+                    attention_bias = local_bias
+            else:
+                # 走正常的 Global Attention 逻辑
+                if attention_bias is not None:
+                    bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
+                    attention_bias = self._cast_attn_bias(bias_slice, dtype)
+            # =========================================================
+
+            # 调用底层的 SDPA / FlashAttention
             att = self._scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attention_bias,
                 dropout_p=self.config.attention_dropout if self.training else 0.0,
-                is_causal=attention_bias is None,
+                # 【重要】如果手动构造了 attention_bias (包括上面的 local_bias)，则必须关闭 is_causal
+                is_causal=(attention_bias is None),
                 max_doc_len=max_doc_len,
                 cu_doc_lens=cu_doc_lens,
             )

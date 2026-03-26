@@ -398,6 +398,16 @@ class ModelConfig(BaseConfig):
     from which layer set sigma
     """
 
+    local_window_size: int = 256
+    """
+    local attention window size
+    """
+
+    num_local_layers: int = 4
+    """
+    the number of local attention layer
+    """
+
 
 
 
