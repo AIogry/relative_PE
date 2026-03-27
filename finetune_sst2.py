@@ -478,7 +478,9 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--eval_interval", type=int, default=100,
-                        help="每隔多少 step 评估一次")
+                        help="每隔多少 step 评估一次 (与eval_interval_samples二选一)")
+    parser.add_argument("--eval_interval_samples", type=int, default=None,
+                        help="每隔多少样本评估一次 (如1000表示每处理1000个样本评估)")
     parser.add_argument("--save_interval", type=int, default=500,
                         help="每隔多少 step 保存 checkpoint")
     
@@ -691,8 +693,29 @@ def main():
     best_checkpoint_path = None
     evals_without_improvement = 0
     
+    # Sample Efficiency Tracking: 记录达到特定准确率所需的步数和样本数
+    # 根据shot设置动态调整目标阈值
+    if args.few_shot > 0 and args.few_shot < 1000:
+        # 小样本情况下降低目标
+        acc_thresholds = [0.60, 0.65, 0.70, 0.75]
+    elif args.few_shot >= 1000 and args.few_shot < 5000:
+        acc_thresholds = [0.70, 0.75, 0.80]
+    elif args.few_shot >= 5000:
+        # 大样本 (5000, 10000)
+        acc_thresholds = [0.75, 0.80, 0.85]
+    else:
+        # full数据集：从50%开始记录，更全面地追踪收敛过程
+        acc_thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+    
+    sample_efficiency = {
+        "thresholds": acc_thresholds,
+        "results": {}  # {threshold: {"step": int, "samples": int, "epoch": float}}
+    }
+    samples_processed = 0  # 已处理的样本数
+    last_eval_samples = 0  # 上次评估时的样本数（用于基于样本的评估间隔）
+    
     log_file = open(os.path.join(args.output_dir, "training_log.txt"), "w")
-    log_file.write("step,epoch,train_loss,eval_acc,eval_f1,learning_rate\n")
+    log_file.write("step,epoch,train_loss,eval_acc,eval_f1,learning_rate,samples_processed\n")
     
     for epoch in range(args.num_epochs):
         model.train()
@@ -706,6 +729,10 @@ def main():
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
+            
+            # 统计样本数
+            batch_size_actual = input_ids.size(0)
+            samples_processed += batch_size_actual
             
             # 前向
             if use_flash_attn:
@@ -744,8 +771,19 @@ def main():
                 
                 accumulated_loss = 0.0
                 
+                # 评估条件：基于step或基于样本数
+                should_eval = False
+                if args.eval_interval_samples is not None:
+                    # 基于样本数的评估
+                    if samples_processed - last_eval_samples >= args.eval_interval_samples:
+                        should_eval = True
+                else:
+                    # 基于step的评估
+                    if global_step % args.eval_interval == 0:
+                        should_eval = True
+                
                 # 评估
-                if global_step % args.eval_interval == 0:
+                if should_eval:
                     eval_results = evaluate(model, val_loader, device, use_amp=use_flash_attn)
                     
                     print(f"\n[Step {global_step}] Eval: Acc={eval_results['accuracy']:.4f}, F1={eval_results['f1']:.4f}")
@@ -759,12 +797,26 @@ def main():
                         "eval/step": global_step,
                     })
                     
-                    log_file.write(f"{global_step},{epoch+1},{accumulated_loss},{eval_results['accuracy']:.4f},{eval_results['f1']:.4f},{scheduler.get_last_lr()[0]:.6f}\n")
+                    log_file.write(f"{global_step},{epoch+1},{accumulated_loss},{eval_results['accuracy']:.4f},{eval_results['f1']:.4f},{scheduler.get_last_lr()[0]:.6f},{samples_processed}\n")
                     log_file.flush()
                     
+                    # Sample Efficiency Tracking: 检查是否达到新的阈值
+                    current_acc = eval_results["accuracy"]
+                    for threshold in acc_thresholds:
+                        thresh_str = f"{threshold:.2f}"
+                        if thresh_str not in sample_efficiency["results"]:
+                            if current_acc >= threshold:
+                                sample_efficiency["results"][thresh_str] = {
+                                    "step": global_step,
+                                    "samples": samples_processed,
+                                    "epoch": epoch + 1 + batch_idx / len(train_loader),
+                                    "accuracy": current_acc
+                                }
+                                print(f"  -> [Sample Efficiency] Reached {threshold*100:.0f}% accuracy at step {global_step} ({samples_processed} samples)")
+                    
                     # 保存最佳模型 (基于accuracy)
-                    if eval_results["accuracy"] > best_acc + args.early_stopping_delta:
-                        best_acc = eval_results["accuracy"]
+                    if current_acc > best_acc + args.early_stopping_delta:
+                        best_acc = current_acc
                         best_checkpoint_path = os.path.join(args.output_dir, "best_model.pt")
                         torch.save({
                             "step": global_step,
@@ -781,6 +833,10 @@ def main():
                     else:
                         evals_without_improvement += 1
                         print(f"  -> No improvement ({evals_without_improvement}/{args.early_stopping_patience})")
+                    
+                    # 更新上次评估的样本数（用于基于样本的评估间隔）
+                    if args.eval_interval_samples is not None:
+                        last_eval_samples = samples_processed
                     
                     # Early stopping
                     if evals_without_improvement >= args.early_stopping_patience:
@@ -812,6 +868,18 @@ def main():
     print(f"Recall: {final_results['recall']:.4f}")
     
     # 保存最终结果
+    # 补充未达到的阈值信息
+    for threshold in acc_thresholds:
+        thresh_str = f"{threshold:.2f}"
+        if thresh_str not in sample_efficiency["results"]:
+            sample_efficiency["results"][thresh_str] = {
+                "step": None,
+                "samples": None,
+                "epoch": None,
+                "accuracy": None,
+                "status": "not_reached"
+            }
+    
     with open(os.path.join(args.output_dir, "final_results.json"), "w") as f:
         json.dump({
             "best_accuracy": final_results['accuracy'],
@@ -821,8 +889,25 @@ def main():
             "best_val_loss": final_results['loss'],
             "trainable_params": param_stats['trainable'],
             "trainable_pct": param_stats['trainable_pct'],
+            "sample_efficiency": sample_efficiency,  # 新增：样本效率指标
+            "total_samples_processed": samples_processed,  # 总处理样本数
             "args": vars(args),
         }, f, indent=2)
+    
+    # 打印 Sample Efficiency 摘要
+    print("\n" + "="*50)
+    print("Sample Efficiency Summary")
+    print("="*50)
+    print(f"{'Target Acc':<12} {'Step':<8} {'Samples':<10} {'Epoch':<8}")
+    print("-"*50)
+    for threshold in acc_thresholds:
+        thresh_str = f"{threshold:.2f}"
+        result = sample_efficiency["results"][thresh_str]
+        if result.get("step") is not None:
+            print(f"{threshold*100:>6.0f}%      {result['step']:<8} {result['samples']:<10} {result['epoch']:.2f}")
+        else:
+            print(f"{threshold*100:>6f}%      {'N/A':<8} {'N/A':<10} {'N/A'}")
+    print("="*50)
     
     wandb.log({
         "final/accuracy": final_results["accuracy"],

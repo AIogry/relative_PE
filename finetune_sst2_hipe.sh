@@ -25,7 +25,6 @@ WANDB_DIR="${ROOT_DIR}/wandb/offline/sst2"
 SST2_DATA_PATH="${ROOT_DIR}/sst2_data"
 
 # HIPE 模型路径 (learnable sigma models)
-# 路径中包含 thrX 标记，表示 threshold (如 thr7 表示 0-7层是RoPE, 8-15层是ScaledRoPE)
 HIPE_512_PATH="${ROOT_DIR}/checkpoints_exp2/c4_300M/learnable_sigma/300M/c4_learnable_sigma_300M_L512_sigma200_thr7/seed_6198/model.pt"
 HIPE_2048_PATH="${ROOT_DIR}/checkpoints_exp2/c4_300M/learnable_sigma/300M/c4_learnable_sigma_300M_L2048_sigma700_thr7/seed_6198/model.pt"
 
@@ -48,11 +47,10 @@ trap cleanup EXIT
 # === 从模型路径自动提取 threshold ===
 extract_threshold() {
     local model_path=$1
-    # 从路径中提取 thrX (如 thr7 -> 7)
     if [[ $model_path =~ thr([0-9]+) ]]; then
         echo "${BASH_REMATCH[1]}"
     else
-        echo "-1"  # 没有找到thr标记，所有层都是ScaledRoPE
+        echo "-1"
     fi
 }
 
@@ -62,8 +60,7 @@ echo ">>> SLURM Job ID: ${JOB_ID}"
 
 # === 全局配置 ===
 MODEL_SIZE="300M"
-SEEDS=(6198)
-NUM_EPOCHS=5
+NUM_EPOCHS=10
 MAX_LENGTH=128
 TRAIN_BS=16
 EVAL_BS=64
@@ -71,13 +68,11 @@ LR=5e-4
 CLASSIFIER_LR=1e-3
 LORA_LR=5e-4
 SIGMA_LR=1e-3
-EVAL_INTERVAL=100
-SAVE_INTERVAL=500
+SAVE_INTERVAL=1000
 GRAD_ACCUM_STEPS=2
-EARLY_STOPPING_PATIENCE=5
 
-# Few-shot 设置: -1=full, 其他为具体样本数
-SHOT_SETTINGS=(-1 100 500 1000 2000 5000 10000)
+# Few-shot 设置
+SHOT_SETTINGS=(-1 100 200 500 1000 2000 5000)
 
 # === LoRA 配置 ===
 LORA_RANKS=(8)
@@ -100,73 +95,34 @@ fi
 FAILED_COUNT=0
 
 # ============================================================
-# 核心函数1：HIPE 可学习 sigma
+# 动态计算评估间隔、早停耐心和seed数量
 # ============================================================
-run_hipe_learnable() {
-    local base_model=$1
-    local seq_len=$2
-    local sigma=$3
-    local few_shot=$4
-    local seed=$5
+get_eval_config() {
+    local few_shot=$1
     
-    # 自动提取 threshold
-    local threshold=$(extract_threshold "$base_model")
-    echo ">>> Detected threshold: $threshold (layers 0-$threshold use fixed RoPE, layers $((threshold+1))-15 use ScaledRoPE)"
-    
-    # 动态早停：full数据集需要更多耐心
-    local patience=$EARLY_STOPPING_PATIENCE
     if [ "$few_shot" -lt 0 ]; then
-        patience=15  # full数据集增加到15
-    elif [ "$few_shot" -ge 5000 ]; then
-        patience=10  # 大数据集也增加
+        # full: 每1000样本评估，耐心30，单seed
+        echo "1000 30 1"
+    elif [ "$few_shot" -le 200 ]; then
+        # 极少数据：每20样本评估，耐心10，多seed
+        echo "20 10 3"
+    elif [ "$few_shot" -le 500 ]; then
+        # 小数据：每50样本评估，耐心8，多seed
+        echo "50 8 3"
+    elif [ "$few_shot" -le 1000 ]; then
+        # 中数据：每100样本评估，耐心6，双seed
+        echo "100 6 2"
+    elif [ "$few_shot" -le 2000 ]; then
+        # 较大数据：每200样本评估，耐心5，双seed
+        echo "200 5 2"
+    else
+        # 大数据：每500样本评估，耐心5，单seed
+        echo "500 5 1"
     fi
-    echo ">>> Early stopping patience: $patience"
-    
-    local shot_str=$([ "$few_shot" -lt 0 ] && echo "full" || echo "shot${few_shot}")
-    local run_id="hipe_${seq_len}_learnable_sigma${sigma}_thr${threshold}_${shot_str}_seed${seed}"
-    local output_dir="${CHECKPOINT_ROOT}/${seq_len}/learnable_thr${threshold}/${shot_str}/seed_${seed}"
-    
-    echo -e "\n>>> [HIPE Learnable - SST-2] Seq: $seq_len | Sigma: $sigma | Threshold: $threshold | Shot: $shot_str | Seed: $seed"
-    
-    $PYTHON_BIN $SCRIPT \
-        --base_model_path $base_model \
-        --model_size $MODEL_SIZE \
-        --local_tokenizer_path $LOCAL_TOKENIZER \
-        --output_dir $output_dir \
-        --run_name $run_id \
-        --use_scaled_rope \
-        --sigma $sigma \
-        --rope_scaling_threshold $threshold \
-        --decay_func $DECAY_FUNC \
-        --learnable_sigma \
-        --sigma_lr $SIGMA_LR \
-        --few_shot $few_shot \
-        --num_epochs $NUM_EPOCHS \
-        --max_length $MAX_LENGTH \
-        --train_batch_size $TRAIN_BS \
-        --eval_batch_size $EVAL_BS \
-        --lr $LR \
-        --classifier_lr $CLASSIFIER_LR \
-        --seed $seed \
-        --eval_interval $EVAL_INTERVAL \
-        --save_interval $SAVE_INTERVAL \
-        --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
-        --early_stopping_patience $patience \
-        --wandb_mode $WANDB_MODE \
-        --wandb_dir $WANDB_DIR \
-        --sst2_data_path $SST2_DATA_PATH
-    
-    local exit_code=$?
-    if [ $exit_code -ne 0 ]; then
-        echo ">>> [ERROR] HIPE learnable failed! Seq: $seq_len, Shot: $shot_str, Seed: $seed"
-        ((FAILED_COUNT++))
-        return 1
-    fi
-    return 0
 }
 
 # ============================================================
-# 核心函数2：HIPE + LoRA
+# 核心函数：HIPE + LoRA
 # ============================================================
 run_hipe_lora() {
     local base_model=$1
@@ -178,20 +134,21 @@ run_hipe_lora() {
     
     # 自动提取 threshold
     local threshold=$(extract_threshold "$base_model")
-    echo ">>> Detected threshold: $threshold (layers 0-$threshold use fixed RoPE, layers $((threshold+1))-15 use ScaledRoPE)"
+    echo ">>> Detected threshold: $threshold"
     
-    # 动态早停：full数据集需要更多耐心
-    local patience=$EARLY_STOPPING_PATIENCE
-    if [ "$few_shot" -lt 0 ]; then
-        patience=15  # full数据集增加到15
-    elif [ "$few_shot" -ge 5000 ]; then
-        patience=10  # 大数据集也增加
-    fi
-    echo ">>> Early stopping patience: $patience"
+    # 获取动态配置
+    read eval_interval_samples patience _ <<< $(get_eval_config $few_shot)
     
     local shot_str=$([ "$few_shot" -lt 0 ] && echo "full" || echo "shot${few_shot}")
     local run_id="hipe_${seq_len}_lora${lora_rank}_sigma${sigma}_thr${threshold}_${shot_str}_seed${seed}"
     local output_dir="${CHECKPOINT_ROOT}/${seq_len}/lora${lora_rank}_thr${threshold}/${shot_str}/seed_${seed}"
+    
+    echo ">>> Early stopping patience: $patience"
+    if [ "$few_shot" -lt 0 ]; then
+        echo ">>> Eval interval: every $eval_interval_samples samples"
+    else
+        echo ">>> Eval interval: every $eval_interval_samples samples (~$((100*eval_interval_samples/few_shot))% of data)"
+    fi
     
     echo -e "\n>>> [HIPE + LoRA - SST-2] Seq: $seq_len | Rank: $lora_rank | Sigma: $sigma | Threshold: $threshold | Shot: $shot_str | Seed: $seed"
     
@@ -219,7 +176,7 @@ run_hipe_lora() {
         --lr $LR \
         --classifier_lr $CLASSIFIER_LR \
         --seed $seed \
-        --eval_interval $EVAL_INTERVAL \
+        --eval_interval_samples $eval_interval_samples \
         --save_interval $SAVE_INTERVAL \
         --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
         --early_stopping_patience $patience \
@@ -229,7 +186,7 @@ run_hipe_lora() {
     
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo ">>> [ERROR] HIPE + LoRA failed! Seq: $seq_len, Rank: $lora_rank, Shot: $shot_str, Seed: $seed"
+        echo ">>> [ERROR] HIPE + LoRA failed! Seq: $seq_len, Shot: $shot_str, Seed: $seed"
         ((FAILED_COUNT++))
         return 1
     fi
@@ -244,31 +201,28 @@ run_all_hipe_experiments() {
     echo ">>> Running HIPE SST-2 Experiments"
     echo "=========================================="
     
-    for seed in "${SEEDS[@]}"; do
-        for shot in "${SHOT_SETTINGS[@]}"; do
-            
+    for shot in "${SHOT_SETTINGS[@]}"; do
+        # 获取该shot配置需要的seed数
+        read _ _ num_seeds <<< $(get_eval_config $shot)
+        
+        echo -e "\n>>> Shot: $shot | Seeds: $num_seeds"
+        
+        # 生成seeds
+        seeds=()
+        for ((i=0; i<num_seeds; i++)); do
+            seeds+=($((6198 + i * 1111)))
+        done
+        
+        for seed in "${seeds[@]}"; do
             # === 512 长度模型 ===
             if [ -f "$HIPE_512_PATH" ]; then
-                run_hipe_learnable $HIPE_512_PATH 512 $SIGMA_512 $shot $seed
-                
-                for rank in "${LORA_RANKS[@]}"; do
-                    run_hipe_lora $HIPE_512_PATH 512 $SIGMA_512 $shot $rank $seed
-                done
-            else
-                echo ">>> WARNING: HIPE 512 model not found at $HIPE_512_PATH"
+                run_hipe_lora $HIPE_512_PATH 512 $SIGMA_512 $shot 8 $seed
             fi
             
             # === 2048 长度模型 ===
             if [ -f "$HIPE_2048_PATH" ]; then
-                run_hipe_learnable $HIPE_2048_PATH 2048 $SIGMA_2048 $shot $seed
-                
-                for rank in "${LORA_RANKS[@]}"; do
-                    run_hipe_lora $HIPE_2048_PATH 2048 $SIGMA_2048 $shot $rank $seed
-                done
-            else
-                echo ">>> WARNING: HIPE 2048 model not found at $HIPE_2048_PATH"
+                run_hipe_lora $HIPE_2048_PATH 2048 $SIGMA_2048 $shot 8 $seed
             fi
-            
         done
     done
 }
@@ -282,40 +236,17 @@ if [ ! -f "$HIPE_512_PATH" ] && [ ! -f "$HIPE_2048_PATH" ]; then
     exit 1
 fi
 
-EXPERIMENT_MODE="${1:-learnable}"
+EXPERIMENT_MODE="${1:-lora}"
 
 echo ">>> Starting HIPE SST-2 Fine-tuning"
 echo ">>> Mode: $EXPERIMENT_MODE"
-echo ">>> Seeds: ${SEEDS[@]}"
-echo ">>> Shot settings: ${SHOT_SETTINGS[@]}"
 
 case "$EXPERIMENT_MODE" in
-    "all")
+    "all"|"lora")
         run_all_hipe_experiments
         ;;
-    "learnable")
-        echo ">>> Running learnable sigma experiments"
-        for shot in "${SHOT_SETTINGS[@]}"; do
-            run_hipe_learnable $HIPE_512_PATH 512 $SIGMA_512 $shot 6198
-            [ -f "$HIPE_2048_PATH" ] && run_hipe_learnable $HIPE_2048_PATH 2048 $SIGMA_2048 $shot 6198
-        done
-        ;;
-    "lora")
-        echo ">>> Running HIPE + LoRA experiments"
-        for shot in "${SHOT_SETTINGS[@]}"; do
-            for rank in "${LORA_RANKS[@]}"; do
-                run_hipe_lora $HIPE_512_PATH 512 $SIGMA_512 $shot $rank 6198
-                [ -f "$HIPE_2048_PATH" ] && run_hipe_lora $HIPE_2048_PATH 2048 $SIGMA_2048 $shot $rank 6198
-            done
-        done
-        ;;
     *)
-        echo "Usage: sbatch $0 {all|learnable|lora}"
-        echo ""
-        echo "Examples:"
-        echo "  sbatch $0              # 运行learnable实验（默认）"
-        echo "  sbatch $0 lora         # 运行LoRA实验"
-        echo "  DEBUG_SHOT=500 sbatch $0 learnable  # Debug模式"
+        echo "Usage: sbatch $0 {all|lora}"
         exit 1
         ;;
 esac

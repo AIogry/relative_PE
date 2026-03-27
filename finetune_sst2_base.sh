@@ -50,22 +50,18 @@ echo ">>> SLURM Job ID: ${JOB_ID}"
 
 # === 全局配置 ===
 MODEL_SIZE="300M"
-SEEDS=(6198)
-NUM_EPOCHS=5          # SST-2通常5个epoch足够
+NUM_EPOCHS=10         # 增加epochs上限，配合早停
 MAX_LENGTH=128
 TRAIN_BS=16
 EVAL_BS=64
 LR=5e-4
 CLASSIFIER_LR=1e-3
 LORA_LR=5e-4
-EVAL_INTERVAL=100     # SST-2训练更快，评估间隔可以更大
-SAVE_INTERVAL=500
+SAVE_INTERVAL=1000
 GRAD_ACCUM_STEPS=2
-EARLY_STOPPING_PATIENCE=5  # 默认早停耐心，实际会根据shot动态调整
 
-# Few-shot 设置: -1=full, 其他为具体样本数
-# 包含更多shot设置以观察性能随数据量变化
-SHOT_SETTINGS=(-1 100 500 1000 2000 5000 10000)
+# Few-shot 设置
+SHOT_SETTINGS=(-1 100 200 500 1000 2000 5000)
 
 # === LoRA 配置 ===
 LORA_RANKS=(8)
@@ -83,7 +79,38 @@ fi
 FAILED_COUNT=0
 
 # ============================================================
-# 核心函数：RoPE + LoRA (推荐)
+# 动态计算评估间隔和早停耐心
+# 原则：
+# 1. 小样本用多seed，大样本用少seed
+# 2. 评估间隔基于样本比例（约10-20%的数据评估一次）
+# 3. 早停耐心基于评估次数（小样本更多耐心）
+# ============================================================
+get_eval_config() {
+    local few_shot=$1
+    
+    if [ "$few_shot" -lt 0 ]; then
+        # full: 每1000样本评估，耐心30（可跑3万样本不改善才停）
+        echo "1000 30 1"  # eval_interval_samples, patience, seeds
+    elif [ "$few_shot" -le 200 ]; then
+        # 极少数据：每20样本评估（约1-2次/epoch），耐心10，多seed
+        echo "20 10 3"
+    elif [ "$few_shot" -le 500 ]; then
+        # 小数据：每50样本评估，耐心8，多seed
+        echo "50 8 3"
+    elif [ "$few_shot" -le 1000 ]; then
+        # 中数据：每100样本评估，耐心6，双seed
+        echo "100 6 2"
+    elif [ "$few_shot" -le 2000 ]; then
+        # 较大数据：每200样本评估，耐心5，双seed
+        echo "200 5 2"
+    else
+        # 大数据：每500样本评估，耐心5，单seed
+        echo "500 5 1"
+    fi
+}
+
+# ============================================================
+# 核心函数：RoPE + LoRA
 # ============================================================
 run_rope_lora() {
     local base_model=$1
@@ -96,14 +123,15 @@ run_rope_lora() {
     local run_id="rope_${seq_len}_lora${lora_rank}_${shot_str}_seed${seed}"
     local output_dir="${CHECKPOINT_ROOT}/${seq_len}/lora${lora_rank}/${shot_str}/seed_${seed}"
     
-    # 动态早停：full数据集需要更多耐心
-    local patience=$EARLY_STOPPING_PATIENCE
+    # 获取动态配置
+    read eval_interval_samples patience _ <<< $(get_eval_config $few_shot)
+    
+    echo ">>> Early stopping patience: $patience (evals)"
     if [ "$few_shot" -lt 0 ]; then
-        patience=15  # full数据集增加到15
-    elif [ "$few_shot" -ge 5000 ]; then
-        patience=10  # 大数据集也增加
+        echo ">>> Eval interval: every $eval_interval_samples samples"
+    else
+        echo ">>> Eval interval: every $eval_interval_samples samples (~$((100*eval_interval_samples/few_shot))% of data)"
     fi
-    echo ">>> Early stopping patience: $patience"
     
     echo -e "\n>>> [RoPE + LoRA - SST-2] Seq: $seq_len | Rank: $lora_rank | Shot: $shot_str | Seed: $seed"
     
@@ -125,7 +153,7 @@ run_rope_lora() {
         --lr $LR \
         --classifier_lr $CLASSIFIER_LR \
         --seed $seed \
-        --eval_interval $EVAL_INTERVAL \
+        --eval_interval_samples $eval_interval_samples \
         --save_interval $SAVE_INTERVAL \
         --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
         --early_stopping_patience $patience \
@@ -135,7 +163,7 @@ run_rope_lora() {
     
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo ">>> [ERROR] RoPE + LoRA failed! Seq: $seq_len, Rank: $lora_rank, Shot: $shot_str, Seed: $seed"
+        echo ">>> [ERROR] RoPE + LoRA failed! Seq: $seq_len, Shot: $shot_str, Seed: $seed"
         ((FAILED_COUNT++))
         return 1
     fi
@@ -143,34 +171,37 @@ run_rope_lora() {
 }
 
 # ============================================================
-# 批量运行函数
+# 批量运行函数 - 根据shot数自动决定seed数量
 # ============================================================
 run_all_rope_experiments() {
     echo -e "\n=========================================="
     echo ">>> Running RoPE SST-2 Experiments"
     echo "=========================================="
     
-    for seed in "${SEEDS[@]}"; do
-        for shot in "${SHOT_SETTINGS[@]}"; do
-            
+    for shot in "${SHOT_SETTINGS[@]}"; do
+        # 获取该shot配置需要的seed数
+        read _ _ num_seeds <<< $(get_eval_config $shot)
+        
+        echo -e "\n>>> Shot: $shot | Seeds: $num_seeds"
+        
+        # 生成seeds（基于6198，确保可复现）
+        seeds=()
+        for ((i=0; i<num_seeds; i++)); do
+            seeds+=($((6198 + i * 1111)))
+        done
+        
+        for seed in "${seeds[@]}"; do
             # === 512 长度模型 ===
             if [ -f "$ROPE_512_PATH" ]; then
-                for rank in "${LORA_RANKS[@]}"; do
-                    run_rope_lora $ROPE_512_PATH 512 $shot $rank $seed
-                done
+                run_rope_lora $ROPE_512_PATH 512 $shot 8 $seed
             else
-                echo ">>> WARNING: RoPE 512 model not found at $ROPE_512_PATH"
+                echo ">>> WARNING: RoPE 512 model not found"
             fi
             
             # === 2048 长度模型 ===
             if [ -f "$ROPE_2048_PATH" ]; then
-                for rank in "${LORA_RANKS[@]}"; do
-                    run_rope_lora $ROPE_2048_PATH 2048 $shot $rank $seed
-                done
-            else
-                echo ">>> WARNING: RoPE 2048 model not found at $ROPE_2048_PATH"
+                run_rope_lora $ROPE_2048_PATH 2048 $shot 8 $seed
             fi
-            
         done
     done
 }
@@ -179,7 +210,6 @@ run_all_rope_experiments() {
 # 主程序
 # ============================================================
 
-# 检查模型是否存在
 if [ ! -f "$ROPE_512_PATH" ] && [ ! -f "$ROPE_2048_PATH" ]; then
     echo ">>> WARNING: No RoPE models found!"
     exit 1
@@ -189,7 +219,6 @@ EXPERIMENT_MODE="${1:-lora}"
 
 echo ">>> Starting RoPE SST-2 Fine-tuning"
 echo ">>> Mode: $EXPERIMENT_MODE"
-echo ">>> Seeds: ${SEEDS[@]}"
 echo ">>> Shot settings: ${SHOT_SETTINGS[@]}"
 
 case "$EXPERIMENT_MODE" in
@@ -198,10 +227,6 @@ case "$EXPERIMENT_MODE" in
         ;;
     *)
         echo "Usage: sbatch $0 {all|lora}"
-        echo ""
-        echo "Examples:"
-        echo "  sbatch $0              # 运行LoRA实验（默认）"
-        echo "  DEBUG_SHOT=500 sbatch $0  # Debug模式"
         exit 1
         ;;
 esac
