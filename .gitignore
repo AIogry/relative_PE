@@ -4,3 +4,4 @@ training_results/
 *.pt
 *.pth
 results_exp1/
+__pycache__/
