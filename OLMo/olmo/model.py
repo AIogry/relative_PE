@@ -266,30 +266,38 @@ def _yarn_get_mscale(scale: float) -> float:
 class RotaryEmbedding(nn.Module):
     """
     [Rotary positional embeddings (RoPE)](https://arxiv.org/abs/2104.09864).
+    Supports YaRN dynamic interpolation for length extrapolation.
     """
 
     def __init__(self, config: ModelConfig, cache: BufferCache):  
         super().__init__()
         self.config = config
         self._cache = cache
+        
+        # 【核心修改】：提前计算并永久保存最纯净的 RoPE 基础频率
+        # 这是 HIPE 能够无视 YaRN 干扰、保持高斯场稳定的绝对锚点！
+        self.base_inv_freq = self._compute_base_inv_freq(_non_meta_init_device(config))
+        
+        # 计算当前实际应该使用的旋转频率 (可能包含 YaRN 压缩)
         self.inv_freq = self.get_inv_freq(_non_meta_init_device(config))
+        
         # Warm up cache.
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
     
-    def get_inv_freq(self, device: torch.device):
+    def _compute_base_inv_freq(self, device: torch.device) -> torch.Tensor:
+        """返回最原始的 RoPE 频率，不含任何长度外推逻辑"""
         dim = self.config.d_model // self.config.n_heads
         i = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-
-        L = self.config.max_sequence_length      # for uniform sampling frequency
-        # uniform sampling frequency
-        if self.config.uniform_frequency:
-            inv_freq = 2.0 * torch.pi * i / (L)  # * dim)
+        if getattr(self.config, 'uniform_frequency', False):
+            L = self.config.max_sequence_length
+            return 2.0 * torch.pi * i / L
         else:
-            inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
+            return 1.0 / (self.config.rope_theta ** (i / dim))
 
-        # for fope
-        if self.config.fope and not self.config.use_place_cells:
-            inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
+    def get_inv_freq(self, device: torch.device):
+        """返回用于实际旋转的频率，此处包含 YaRN 的动态插值逻辑"""
+        # 从纯净基础频率开始
+        inv_freq = self._compute_base_inv_freq(device)
 
         # --- YaRN integration ---
         if getattr(self.config, "yarn_enabled", False):
@@ -306,7 +314,7 @@ class RotaryEmbedding(nn.Module):
                 beta = self.config.yarn_beta_fast
                 gamma = _yarn_ramp(r, alpha, beta)  # shape: (dim//2,)
 
-                # h(θ) = (1 - γ) * (θ / s) + γ * θ ⇒ inv_freq' = inv_freq / [(1-γ)/s + γ]
+                # 动态插值压缩频率
                 interpolation_factor = (1 - gamma) / scale + gamma
                 inv_freq = inv_freq / interpolation_factor
 
@@ -556,7 +564,12 @@ class GridEmbedding(RotaryEmbedding):
 
 class ScaledRotaryEmbedding(RotaryEmbedding):
     """
-    Scaled RoPE with Optional Layer-wise Control.
+    HIPE: Hippocampus-Inspired Positional Embedding with Optional Layer-wise Control.
+    
+    Creates a static semantic amplitude mask based on base frequencies.
+    This mask is computed once and never changes, ensuring stable frequency band
+    allocation regardless of YaRN dynamic interpolation.
+    
     Modes:
     1. Uniform Scaling: All layers use the same sigma (if threshold < 0).
     2. Bio-Gradient: Shallow layers use Standard RoPE, Deep layers use Scaled RoPE (if threshold >= 0).
@@ -568,78 +581,86 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
             sigma (float): The scaling factor.
             layer_index (int, optional): The current layer index.
         """
+        # 先调用父类初始化，这会创建 base_inv_freq 和 inv_freq
         super().__init__(config, cache)
         
-        # --- 1. 更加健壮的层级控制逻辑 ---
+        self._sigma_input = sigma
+        self._layer_index = layer_index
         
-        # 默认行为：启用 Scaling (即假设我们想要全层应用 Sigma)
-        use_scaling = True
-        
-        # 获取阈值。关键修改：默认值设为 -1 (代表禁用层级策略，保持 Uniform)
-        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活HIPE
-        scaling_threshold = getattr(config, "rope_scaling_threshold", -1)
-        
-        # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值 时，才强制关闭 Scaling
-        if scaling_threshold >= 0 and layer_index is not None:
-            if layer_index <= scaling_threshold:
-                use_scaling = False
-                print(f"Layer {layer_index}: Scaling DISABLED (Gradient Mode)")
-        
-        # 否则，use_scaling 保持为 True，即执行原来的逻辑（全层使用传入的 sigma）
-        
-        # --------------------------------
+        # 实例化时计算一次静态掩码，之后永不改变
+        self._update_scale_factor(_non_meta_init_device(config))
 
-        # 获取维度信息
+    def _update_scale_factor(self, device: torch.device):
+        """
+        计算 HIPE 的静态幅值调制掩码。
+        【关键】：使用 base_inv_freq（纯净频率）而非 get_inv_freq()（可能被YaRN压缩）
+        """
+        use_scaling = True
+        scaling_threshold = getattr(self.config, "rope_scaling_threshold", -1)
+        
+        if scaling_threshold >= 0 and self._layer_index is not None:
+            if self._layer_index <= scaling_threshold:
+                use_scaling = False
+                print(f"Layer {self._layer_index}: Scaling DISABLED (Gradient Mode)")
+
         dim = self.config.d_model // self.config.n_heads
         
-        # --- 2. 如果不启用 Scaling (即退化为 Standard RoPE) ---
-        # 这是针对需要layer分布的前几层，前几层需要使用原始的RoPE
         if not use_scaling:
-            scale_full = torch.ones(self.config.n_heads, dim)
-            self.register_buffer('scale_factor', scale_full)
+            scale_full = torch.ones(self.config.n_heads, dim, device=device)
+            if hasattr(self, 'scale_factor'):
+                self.scale_factor.copy_(scale_full)
+            else:
+                self.register_buffer('scale_factor', scale_full)
             return 
 
-        # --- 3. 如果启用 Scaling (应用 Sigma) ---
-        
-        if isinstance(sigma, float):
-            sigmas = [sigma] * self.config.n_heads
+        if isinstance(self._sigma_input, float):
+            sigmas = [self._sigma_input] * self.config.n_heads
         else:
-            sigmas = sigma
+            sigmas = self._sigma_input
             
         if len(sigmas) != self.config.n_heads:
              raise ValueError(f"Sigma count ({len(sigmas)}) must match head count ({self.config.n_heads})")
 
         with torch.no_grad():
-            device = _non_meta_init_device(config)
-            inv_freq = self.get_inv_freq(device) 
+            # 【究极修正】：强行截断 YaRN 污染！
+            # 使用父类中保存的纯净基础频率，而非可能被YaRN压缩的 get_inv_freq()
+            base_freqs = self.base_inv_freq.to(device).view(1, -1)
             
             sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
-            freqs = inv_freq.view(1, -1) 
             
             decay_func = getattr(self.config, 'decay_func', 'gaussian')
             
+            # 使用纯净的 base_freqs 生成严格的、平滑的、不可变的高斯场
             if decay_func == 'gaussian':
-                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+                scale = torch.exp(-sigmas_tensor**2 * base_freqs**2/2) * base_freqs
             elif decay_func == 'exp':
-                scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + freqs**2) * freqs
+                scale = (1/sigmas_tensor)**2 / ((1/sigmas_tensor)**2 + base_freqs**2) * base_freqs
             elif decay_func == 'power':
-                scale = torch.exp(-sigmas_tensor * freqs) * freqs
+                scale = torch.exp(-sigmas_tensor * base_freqs) * base_freqs
             elif decay_func == 'segmented':
                 order = getattr(self.config, 'decay_order', 8)
-                scale = (1.0 / (1.0 + (sigmas_tensor * freqs) ** order)) * freqs
+                scale = (1.0 / (1.0 + (sigmas_tensor * base_freqs) ** order)) * base_freqs
             else:
-                scale = torch.exp(-sigmas_tensor**2 * freqs**2/2) * freqs
+                scale = torch.exp(-sigmas_tensor**2 * base_freqs**2/2) * base_freqs
             
             scale = torch.sqrt(scale)
             scale_full = torch.cat((scale, scale), dim=-1)
 
+            # 全局能量归一化
             correction_factor = torch.rsqrt(torch.mean(scale_full**2))
             scale_full = scale_full * correction_factor
 
-            self.register_buffer('scale_factor', scale_full)
+            # 注册为不可学习的 buffer，外推时将保持此特征分布不变
+            if hasattr(self, 'scale_factor'):
+                self.scale_factor.copy_(scale_full)
+            else:
+                self.register_buffer('scale_factor', scale_full)
 
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # 第一步 (HIPE)：应用静态的高斯幅值衰减掩码
         t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        
+        # 第二步 (YaRN)：交给父类去应用动态的相位旋转和温度缩放
         return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
     
 
