@@ -34,11 +34,4 @@ sbatch ${SCRIPT_DIR}/run_fewshot_extrap.sh \
     "${CKPT_ROOT}/${MODEL_SIZE}_hipe_yarn_L${TRAIN_LEN}_sig${SIGMA}_s${SEED}/model_final.pt" \
     hipe_yarn ${SIGMA} ${SEED}
 
-echo "All baseline evaluation jobs submitted!"
-echo ""
-echo "Next: Run multi-shot experiments for HIPE+YaRN..."
-sbatch \${SCRIPT_DIR}/run_multi_shot_experiments.sh \\
-    "\${CKPT_ROOT}/\${MODEL_SIZE}_hipe_yarn_L\${TRAIN_LEN}_sig\${SIGMA}_s\${SEED}/model_final.pt" \\
-    hipe_yarn \${SIGMA} \${SEED}
-
-echo "All jobs submitted!"
+echo "All evaluation jobs submitted!"
