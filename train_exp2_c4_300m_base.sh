@@ -47,8 +47,8 @@ GLOBAL_BS=64
 SEEDS=(6198) # 1024 7 568 3427)
 
 # C4 专享大数据量配置
-MAX_TOKENS=7000000000 # 7B token
-TRAIN_SAMPLES=10000000 # 10M samples
+MAX_TOKENS=1000000000 # 1B token
+TRAIN_SAMPLES=5000000 # 10M samples
 VAL_SAMPLES=10000
 
 # === DEBUG 配置 ===
@@ -64,7 +64,7 @@ else
 fi
 
 MODELS=("300M")
-LENGTHS=(512 1024 2048)
+LENGTHS=(2048)
 
 # ============================================================
 # 核心函数1：计算Micro Batch Size (300M 专属)
@@ -120,9 +120,9 @@ run_baseline_experiment() {
     done
 }
 
-run_baseline_experiment "rope" ""
+# run_baseline_experiment "rope" ""
 run_baseline_experiment "xpos" "--xpos"
-run_baseline_experiment "nope" "--nope"
-run_baseline_experiment "alibi" "--alibi"
+# run_baseline_experiment "nope" "--nope"
+# run_baseline_experiment "alibi" "--alibi"
 
 echo -e "\n>>> All C4 300M Baselines Completed."
