@@ -61,7 +61,7 @@ SAVE_INTERVAL=1000
 GRAD_ACCUM_STEPS=2
 
 # Few-shot 设置
-SHOT_SETTINGS=(-1 100 200 500 1000 2000 5000)
+SHOT_SETTINGS=(1 5 10 50)  #(-1 100 200 500 1000 2000 5000)
 
 # === LoRA 配置 ===
 LORA_RANKS=(8)
@@ -89,23 +89,29 @@ get_eval_config() {
     local few_shot=$1
     
     if [ "$few_shot" -lt 0 ]; then
-        # full: 每1000样本评估，耐心30（可跑3万样本不改善才停）
-        echo "1000 30 1"  # eval_interval_samples, patience, seeds
+        # full: 每1000样本评估，耐心30，单seed
+        echo "1000 30 1"
+    elif [ "$few_shot" -le 10 ]; then
+        # 超少数据 (1, 5, 10): 每1个样本评估（最精细），耐心20，5个seeds
+        echo "1 20 5"
+    elif [ "$few_shot" -le 50 ]; then
+        # 极少数据 (50): 每5样本评估，耐心15，5个seeds
+        echo "5 15 5"
     elif [ "$few_shot" -le 200 ]; then
-        # 极少数据：每20样本评估（约1-2次/epoch），耐心10，多seed
-        echo "20 10 3"
+        # 少数据 (100-200): 每10样本评估，耐心12，3个seeds
+        echo "10 12 3"
     elif [ "$few_shot" -le 500 ]; then
-        # 小数据：每50样本评估，耐心8，多seed
-        echo "50 8 3"
+        # 小数据：每20样本评估，耐心10，3个seeds
+        echo "20 10 3"
     elif [ "$few_shot" -le 1000 ]; then
-        # 中数据：每100样本评估，耐心6，双seed
-        echo "100 6 2"
+        # 中数据：每50样本评估，耐心8，双seed
+        echo "50 8 2"
     elif [ "$few_shot" -le 2000 ]; then
-        # 较大数据：每200样本评估，耐心5，双seed
-        echo "200 5 2"
+        # 较大数据：每100样本评估，耐心6，双seed
+        echo "100 6 2"
     else
-        # 大数据：每500样本评估，耐心5，单seed
-        echo "500 5 1"
+        # 大数据：每200样本评估，耐心5，单seed
+        echo "200 5 1"
     fi
 }
 

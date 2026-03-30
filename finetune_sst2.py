@@ -695,8 +695,14 @@ def main():
     
     # Sample Efficiency Tracking: 记录达到特定准确率所需的步数和样本数
     # 根据shot设置动态调整目标阈值
-    if args.few_shot > 0 and args.few_shot < 1000:
-        # 小样本情况下降低目标
+    if args.few_shot > 0 and args.few_shot <= 10:
+        # 超少样本 (1, 5, 10): 从随机水平开始记录 (SST-2平衡数据集随机~50%)
+        acc_thresholds = [0.50, 0.55, 0.60, 0.65, 0.70]
+    elif args.few_shot > 10 and args.few_shot <= 50:
+        # 极少样本 (50): 稍微提高目标
+        acc_thresholds = [0.55, 0.60, 0.65, 0.70, 0.75]
+    elif args.few_shot > 50 and args.few_shot < 1000:
+        # 小样本 (100-500): 标准小样本目标
         acc_thresholds = [0.60, 0.65, 0.70, 0.75]
     elif args.few_shot >= 1000 and args.few_shot < 5000:
         acc_thresholds = [0.70, 0.75, 0.80]
