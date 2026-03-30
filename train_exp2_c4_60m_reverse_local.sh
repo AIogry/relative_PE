@@ -52,8 +52,8 @@ TRAIN_SAMPLES=2000000
 VAL_SAMPLES=10000
 
 # === DEBUG 配置 ===
-#DEBUG_STEPS="" 
-DEBUG_STEPS=200
+DEBUG_STEPS="" 
+# DEBUG_STEPS=200
 
 if [ -n "$DEBUG_STEPS" ]; then
     echo ">>> [DEBUG MODE ENABLED] Steps: $DEBUG_STEPS"
@@ -64,7 +64,7 @@ else
 fi
 
 # === 调参网格 (Grid Search) ===
-LENGTHS=(1024 2048)
+LENGTHS=(1024)
 WINDOW_SIZES=(128)
 SIGMAS=(200.0 300.0)
 
