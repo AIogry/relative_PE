@@ -1798,9 +1798,17 @@ class OLMoBlock(nn.Module):
             # 获取 config 中传递的窗口大小和局部层数量
             local_window = getattr(self.config, "local_window_size", -1)
             num_local_layers = getattr(self.config, "num_local_layers", 0)
+            n_layers = getattr(self.config, "n_layers", 8)
             
             # 判断当前层是否需要使用局部注意力
-            is_local_layer = (local_window > 0) and (self.layer_id < num_local_layers)
+            # num_local_layers > 0: 前 N 层使用局部注意力 (0, 1, ..., N-1)
+            # num_local_layers < 0: 后 |N| 层使用局部注意力 (L-|N|, ..., L-1)
+            if num_local_layers > 0:
+                is_local_layer = (local_window > 0) and (self.layer_id < num_local_layers)
+            elif num_local_layers < 0:
+                is_local_layer = (local_window > 0) and (self.layer_id >= n_layers + num_local_layers)
+            else:
+                is_local_layer = False
 
             if is_local_layer:
                 # 生成序列的绝对位置索引
