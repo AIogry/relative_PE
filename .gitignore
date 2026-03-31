@@ -5,3 +5,4 @@ training_results/
 *.pth
 results_exp1/
 __pycache__/
+configs/OLMo-300M.yaml
