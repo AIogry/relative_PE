@@ -1,8 +1,3 @@
-"""
-This is a self-contained and flexible beam search implementation adapted from
-AllenNLP's beam search: https://github.com/allenai/allennlp/blob/main/allennlp/nn/beam_search.py
-"""
-
 import copy
 import warnings
 from abc import abstractmethod

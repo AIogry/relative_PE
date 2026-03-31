@@ -244,7 +244,6 @@ class ModelConfig(BaseConfig):
     """
 
     n_heads: int = 8
-    # 12
     """
     The number of self-attention heads.
     """
@@ -386,9 +385,6 @@ class ModelConfig(BaseConfig):
     """
 
     use_scaled_rope1: bool = False
-    """
-    for shujun's scaled rotary embedding
-    """
 
     sigma_vertical: bool =False
 
@@ -511,16 +507,8 @@ class ModelConfig(BaseConfig):
     """
 
     # train_max_sequence_length: int = 512
-    """
-    The maxium input training sequence length
-    when use it, disable max_sequence_lengh
-    """
 
     # val_max_sequence_length: int = 512
-    """
-    The maxisum evalution sequence length
-    to evaluate the length extension
-    """
 
     include_bias: bool = True
     """

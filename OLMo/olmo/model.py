@@ -1,9 +1,3 @@
-"""
-Adapted from
-[MosaiclML](https://github.com/mosaicml/examples.git) and
-[minGPT](https://github.com/karpathy/minGPT.git)
-"""
-
 from __future__ import annotations
 
 import logging
@@ -554,21 +548,18 @@ class GridEmbedding(RotaryEmbedding):
     
 
 
-class ScaledRotaryEmbedding(RotaryEmbedding):   # 增加了动态外推频率函数
+class ScaledRotaryEmbedding(RotaryEmbedding):
     """
     Scaled RoPE with Optional Layer-wise Control.
     """
     def __init__(self, config: ModelConfig, cache: BufferCache, sigma: float = 1.0, layer_index: Optional[int] = None):
         super().__init__(config, cache)
         
-        # 保存这些属性，以便后续动态重算时使用
         self._sigma_input = sigma
         self._layer_index = layer_index
         
-        # 初次计算 Scale Factor
         self._update_scale_factor(_non_meta_init_device(config))
 
-    # [新增修改]：提取出独立的更新函数，解决动态外推时的频率错位问题
     def _update_scale_factor(self, device: torch.device):
         use_scaling = True
         scaling_threshold = getattr(self.config, "rope_scaling_threshold", -1)
@@ -581,7 +572,6 @@ class ScaledRotaryEmbedding(RotaryEmbedding):   # 增加了动态外推频率函
         
         if not use_scaling:
             scale_full = torch.ones(self.config.n_heads, dim, device=device)
-            # 动态更新 buffer
             if hasattr(self, 'scale_factor'):
                 self.scale_factor.copy_(scale_full)
             else:
@@ -594,7 +584,6 @@ class ScaledRotaryEmbedding(RotaryEmbedding):   # 增加了动态外推频率函
             sigmas = self._sigma_input
             
         with torch.no_grad():
-            # 关键：这里获取的是当前最新的 inv_freq（可能已经被 YaRN 压缩过）
             inv_freq = self.get_inv_freq(device) 
             
             sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
@@ -620,7 +609,6 @@ class ScaledRotaryEmbedding(RotaryEmbedding):   # 增加了动态外推频率函
             correction_factor = torch.rsqrt(torch.mean(scale_full**2))
             scale_full = scale_full * correction_factor
 
-            # 动态更新 buffer
             if hasattr(self, 'scale_factor'):
                 self.scale_factor.copy_(scale_full)
             else:
@@ -631,7 +619,7 @@ class ScaledRotaryEmbedding(RotaryEmbedding):   # 增加了动态外推频率函
         return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
 
 
-class ScaledRotaryEmbedding1(RotaryEmbedding):      # yarn+HIPE之前的代码
+class ScaledRotaryEmbedding1(RotaryEmbedding):
     """
     Scaled RoPE with Optional Layer-wise Control.
     Modes:
@@ -647,36 +635,22 @@ class ScaledRotaryEmbedding1(RotaryEmbedding):      # yarn+HIPE之前的代码
         """
         super().__init__(config, cache)
         
-        # --- 1. 更加健壮的层级控制逻辑 ---
-        
-        # 默认行为：启用 Scaling (即假设我们想要全层应用 Sigma)
         use_scaling = True
         
-        # 获取阈值。关键修改：默认值设为 -1 (代表禁用层级策略，保持 Uniform)
-        # 只有当你在 config 中显式设置了 rope_scaling_threshold >= 0 时，才会激活HIPE
         scaling_threshold = getattr(config, "rope_scaling_threshold", -1)
         
-        # 仅当阈值有效(>=0) 且 当前层号已知 且 当前层 <= 阈值 时，才强制关闭 Scaling
         if scaling_threshold >= 0 and layer_index is not None:
             if layer_index <= scaling_threshold:
                 use_scaling = False
                 print(f"Layer {layer_index}: Scaling DISABLED (Gradient Mode)")
         
-        # 否则，use_scaling 保持为 True，即执行原来的逻辑（全层使用传入的 sigma）
-        
-        # --------------------------------
-
-        # 获取维度信息
         dim = self.config.d_model // self.config.n_heads
         
-        # --- 2. 如果不启用 Scaling (即退化为 Standard RoPE) ---
-        # 这是针对需要layer分布的前几层，前几层需要使用原始的RoPE
         if not use_scaling:
             scale_full = torch.ones(self.config.n_heads, dim)
             self.register_buffer('scale_factor', scale_full)
-            return 
-
-        # --- 3. 如果启用 Scaling (应用 Sigma) ---
+            return
+        
         
         if isinstance(sigma, float):
             sigmas = [sigma] * self.config.n_heads
@@ -741,22 +715,16 @@ class ScaledRotaryEmbedding0(RotaryEmbedding):
                 Can be a single float to apply to all heads, or a list of floats
                 with one value per head. Defaults to 1.0.
         """
-        # sigma arranged vertically​
         self.sigma_vertical = getattr(config, "sigma_vertical", False)
         super().__init__(config, cache)
         
 
-        # ---------------------------------------------
-
-        # --- Start of modifications ---
-
-        # sigma vertical (nheads, n_omega_intervals * 2) or horizontal (nheads, 1)
         self.sigma = None
         self.n_omega_intervals = None
         self.dim_intervalsize = None
         dim = self.config.d_model // self.config.n_heads
-        self.n_omegas = dim // 2  # 1/2 dimension
-        self.omega_interval_indices = None  # 每个ω_d所属的区间索引（sigma_vertical=True时有效）
+        self.n_omegas = dim // 2
+        self.omega_interval_indices = None
 
         if self.sigma_vertical:
             if isinstance(sigma, float):
@@ -777,7 +745,6 @@ class ScaledRotaryEmbedding0(RotaryEmbedding):
                 0, self.n_omega_intervals - 1, self.n_omegas, dtype=torch.long).to(_non_meta_init_device(config))
         else:
             if isinstance(sigma, float):
-                # If a single sigma is provided, create a list to use the same value for all heads.
                 self.sigma = [sigma] * self.config.n_heads
             else:
                 self.sigma = sigma
@@ -812,12 +779,8 @@ class ScaledRotaryEmbedding0(RotaryEmbedding):
             # Create a tensor of sigmas for broadcasting. Shape: (n_heads, 1)
 
             if self.sigma_vertical:
-                # 纵向sigma：所有head共享同一套区间sigma
-                # sigma_tensor形状：(num_omega_intervals,) → 转换为(1, num_omegas)（按区间广播）
-                T_sigma = torch.tensor(self.sigma, device=device, dtype=torch.float)  # (n_omega_intervals, )
-                # 按区间索引分配sigma：每个ω_d获取所属区间的sigma
-                sigma_per_omega = T_sigma[self.omega_interval_indices]  # 形状：(num_omegas,)
-                # 广播到所有head：形状→(n_heads, num_omegas)（所有head共享同一套omega-sigma映射）
+                T_sigma = torch.tensor(self.sigma, device=device, dtype=torch.float)
+                sigma_per_omega = T_sigma[self.omega_interval_indices]
                 sigmas_tensor = sigma_per_omega.unsqueeze(0).repeat(self.config.n_heads, 1)
             else:
                 sigmas_tensor = torch.tensor(self.sigma, device=device, dtype=torch.float).view(self.config.n_heads, 1)
@@ -838,19 +801,10 @@ class ScaledRotaryEmbedding0(RotaryEmbedding):
                 elif self.config.decay_func == 'power':
                     scale = torch.exp(-sigmas_tensor*freqs)*freqs
                 elif self.config.decay_func == 'segmented':
-                    # Butterworth filter
-                    # 【New】Segmented Frequency Scaling (Butterworth Style)
-                    # Flat-top decay, lowpass filtering
-                    # when theta < 1/sigma, scale approx 1
-                    # when theta > 1/sigma, scale decay steeply
-                    # decay_order (k) control the steepness of the descent
+                    order = getattr(self.config, 'decay_order', 8)
                     
-                    order = getattr(self.config, 'decay_order', 8) # default = 8, it produces a distinct "segmentation" effect.
-                    
-                    # 核心公式: 1 / (1 + (sigma * theta)^k)
                     filter_profile = 1.0 / (1.0 + (sigmas_tensor * freqs) ** order)
                     
-                    # 应用滤波器并保留原始频率密度项 (freqs)
                     scale = filter_profile * freqs
             else:
                 scale = torch.exp(-sigmas_tensor**2 * freqs**2/2)*freqs
@@ -868,21 +822,13 @@ class ScaledRotaryEmbedding0(RotaryEmbedding):
             # Register as a buffer so it moves to the correct device with the model.
             self.register_buffer('scale_factor', scale_full)
             #print(self.scale_factor)
-        # --- End of modifications ---
-
+        
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Applies scaling to the input tensor `t` (q or k) before applying the rotation.
         """
-        # --- Start of modifications ---
-
-        # t has shape (B, nh, T, hs)
-        # self.scale_factor has shape (nh, hs)
-        # We reshape scale_factor to (1, nh, 1, hs) for broadcasting.
         t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
-        # --- End of modifications ---
-
-        # Now call the original rotation logic from the parent class on the scaled tensor.
+        
         return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
 
 """
@@ -975,7 +921,7 @@ class ScaledRoPE(RotaryEmbedding):
 """
 
 
-# 尝试生物真实多尺度，数据量从小到大变化测试，设置validation调整lr,epoch,batchsize等超参数，micro_batchsize和batchsize区别
+
 
 
 class ScaledRoPE(nn.Module):
@@ -1003,11 +949,8 @@ class ScaledRoPE(nn.Module):
         self.register_buffer("w_cos", w_cos)
 
     def _get_rotary_embedding(self, seq_len: int, device: torch.device):
-        """复用 OLMo 的缓存机制，预计算 cos/sin embedding"""
         cache_key_sin = "scaled_rope_pos_sin"
         cache_key_cos = "scaled_rope_pos_cos"
-
-        # 尝试从缓存读取
         if (
             (pos_sin := self._cache.get(cache_key_sin)) is not None
             and (pos_cos := self._cache.get(cache_key_cos)) is not None
@@ -1022,15 +965,15 @@ class ScaledRoPE(nn.Module):
                 self._cache[cache_key_cos] = pos_cos
             return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
 
-        # 缓存未命中，重新计算
+
         with torch.autocast(device.type, enabled=False):
             pos = torch.arange(seq_len, device=device, dtype=torch.float)
             freqs = torch.einsum("i,d->id", pos, self.inv_freq)  # (seq_len, d_half)
             positions = torch.cat((freqs, freqs), dim=-1)  # (seq_len, d_head)
-            pos_sin = positions.sin()[None, None, :, :]  # (1, 1, seq_len, d_head)
+            pos_sin = positions.sin()[None, None, :, :]
             pos_cos = positions.cos()[None, None, :, :]
 
-        # 存入缓存
+
         self._cache[cache_key_sin] = pos_sin
         self._cache[cache_key_cos] = pos_cos
         return pos_sin, pos_cos
@@ -1071,7 +1014,6 @@ class ScaledRoPE(nn.Module):
             T_k = k_.shape[-2]
             max_len = max(T_q, T_k)
 
-            # 获取预计算的 RoPE embedding（带缓存）
             pos_sin_full, pos_cos_full = self._get_rotary_embedding(max_len, q_.device)
             pos_sin_full = pos_sin_full.type_as(q_)
             pos_cos_full = pos_cos_full.type_as(q_)
@@ -1091,21 +1033,18 @@ class ScaledRoPE(nn.Module):
 class DiagPositionEmbedding(nn.Module):
     def __init__(self, config, cache):
         super().__init__()
-        self.dim = config.d_model // config.n_heads  # head_dim
+        self.dim = config.d_model // config.n_heads
         self.base = getattr(config, "rope_theta", 10000.0)
         self.max_seq_len = getattr(config, "max_sequence_length", 8192)
 
-        # 构建 theta_d = base^(-2d/dim)
+
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        # 保存为 buffer，支持缓存
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._cos_cached = None
         self._sin_cached = None
 
     def _update_cos_sin_tables(self, x, seq_len):
-        # x: (B, nh, T, hd)
         if seq_len > self.max_seq_len:
-            # 动态外推（可选）
             self.max_seq_len = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq)
@@ -1240,10 +1179,8 @@ class PlaceCellEmbedding(FourierEmbedding):
 class DiagonalPositionEncoding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dim = config.d_model  # 注意：这里用 full d_model，不是 head_dim
-        # 你也可以用 head_dim，但需确保与 attention 中 q,k 的最后一维对齐
+        self.dim = config.d_model
         base = getattr(config, "rope_theta", 10000.0)
-        # 频率 theta_d = base^(-2d/dim)
         theta = base ** (-2.0 * torch.arange(0, self.dim).float() / self.dim)
         self.register_buffer("theta", theta, persistent=True)
 
@@ -1297,30 +1234,21 @@ class XPosEmbedding(RotaryEmbedding):
         
         dim = config.d_model // config.n_heads
         
-        # [关键修复] 调整 Scale 的范围
-        # 原论文公式: (i + 0.4d) / (1.4d) -> 范围约 [0.28, 1.0] -> 导致 1024 步后 NaN
-        # 修正公式: 映射到 [0.95, 1.0] -> 保证 1024 步后数值仍在 bfloat16 范围内
-        # calculation: 0.95^1024 ~= 1.6e-23 (bfloat16 min ~= 1e-38), safe.
-        
         min_decay = 0.95 
         max_decay = 1.0
         
-        # 生成线性插值
         indices = torch.arange(0, dim, 2, dtype=torch.float32)
         scale = min_decay + (max_decay - min_decay) * (indices / dim)
         
         self.register_buffer("scale", scale)
 
     def get_scale(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        # Calculate gamma^t
         t = torch.arange(seq_len, device=device, dtype=self.scale.dtype)
-        power = t[:, None] # [Seq, 1]
+        power = t[:, None]
         
-        # [新增] 增加一个极小的 epsilon 防止完全为 0
-        scale_val = self.scale.to(device) ** power # [Seq, Dim/2]
+        scale_val = self.scale.to(device) ** power
         
-        # Repeat for sin/cos shape
-        scale_val = torch.cat([scale_val, scale_val], dim=-1) # [Seq, Dim]
+        scale_val = torch.cat([scale_val, scale_val], dim=-1)
         
         return scale_val[None, None, :, :]
 
@@ -1333,15 +1261,12 @@ class XPosEmbedding(RotaryEmbedding):
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]
             
-            # 1. Get Standard RoPE cos/sin
             pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
             pos_sin = pos_sin.type_as(q_)
             pos_cos = pos_cos.type_as(q_)
             
-            # 2. Get XPos Scale
             scale = self.get_scale(key_len, q_.device).type_as(q_)
 
-            # 3. Apply to Q
             scale_q = scale[:, :, -query_len:, :]
             sin_q = pos_sin[:, :, -query_len:, :]
             cos_q = pos_cos[:, :, -query_len:, :]
@@ -1349,10 +1274,7 @@ class XPosEmbedding(RotaryEmbedding):
             q_emb = (q_ * cos_q) + (self.rotate_half(q_) * sin_q)
             q_emb = q_emb * scale_q
             
-            # 4. Apply to K (Inverse Scale)
-            # [关键修复] 增加 clamp 防止除以 0 或数值爆炸
             scale_k_slice = scale[:, :, :key_len, :]
-            # 限制最小值为 1e-6，防止除零
             scale_k_safe = torch.clamp(scale_k_slice, min=1e-6)
             scale_k = 1.0 / scale_k_safe
             
@@ -1527,28 +1449,18 @@ class OLMoBlock(nn.Module):
                 )
             else:
                 self.rotary_emb = FourierEmbedding(config, self.__cache)
-        # === [Model.py 修复代码] ===
         elif self.config.rope:
             use_scaled = getattr(self.config, 'use_scaled_rope1', False)
             
-            # 1. 获取 Sigma 配置
             raw_sigma = getattr(self.config, 'scaled_rope_sigmas', None)
             if raw_sigma is None:
                 raw_sigma = self.config.scaled_rope_sigma
             
             current_layer_sigma = raw_sigma
             
-            # 2. 如果是列表，取当前层的值
             if use_scaled and isinstance(raw_sigma, list) and len(raw_sigma) == config.n_layers:
                 current_layer_sigma = raw_sigma[self.layer_id]
-                # Log only once per layer to avoid spam
-                # log.info(f"Layer {self.layer_id}: Sigma={current_layer_sigma}")
 
-            # 3. 决策：到底用哪个 Embedding 类？
-            # 如果 current_layer_sigma 是 None，说明这一层不仅不 Scaling，
-            # 甚至不应该实例化 ScaledRotaryEmbedding (因为它处理不了 None)
-            # 我们直接回退到标准 RotaryEmbedding
-            
             if use_scaled and current_layer_sigma is not None:
                 self.rotary_emb = ScaledRotaryEmbedding(
                     config, 
@@ -1559,10 +1471,7 @@ class OLMoBlock(nn.Module):
             elif getattr(self.config, 'use_scaled_rope2', False):
                 self.rotary_emb = ScaledRoPE(config)
             else:
-                # Fallback to Standard RoPE
-                # 当 sigma 为 None 时也会走到这里，这正是我们想要的 (Layer 0, 1)
                 self.rotary_emb = RotaryEmbedding(config, self.__cache)
-        # ==========================
         
         elif getattr(self.config, 'nope', False):
             self.rotary_emb = NoPE(config, self.__cache)
@@ -1727,12 +1636,7 @@ class OLMoBlock(nn.Module):
         present = (k, v) if use_cache else None
         T_k = k.size(-2)  # total key length (including cache)
 
-        # ----------------------------
-        # ✅ NEW: Diagonal Modulated PE
-        # ----------------------------
         if getattr(self.config, 'use_diag_pe', False):
-            # ... (这部分保持你原来上传代码的原样，不要动) ...
-            # We do NOT use FlashAttention or SDPA — compute scores manually
             assert max_doc_len is None and cu_doc_lens is None, "Document masking not supported in DMPE yet"
             
             # Expand k/v heads if needed (GQA)
@@ -1792,56 +1696,39 @@ class OLMoBlock(nn.Module):
             if hasattr(self, 'rotary_emb') and self.rotary_emb is not None:
                 q, k = self.rotary_emb(q, k)
 
-            # =========================================================
-            # ✅ 新增：Local Attention 掩码构造逻辑
-            # =========================================================
-            # 获取 config 中传递的窗口大小和局部层数量
             local_window = getattr(self.config, "local_window_size", -1)
             num_local_layers = getattr(self.config, "num_local_layers", 0)
             
-            # 判断当前层是否需要使用局部注意力
             is_local_layer = (local_window > 0) and (self.layer_id < num_local_layers)
 
             if is_local_layer:
-                # 生成序列的绝对位置索引
                 q_idx = torch.arange(T_q, device=q.device).view(-1, 1)
                 k_idx = torch.arange(T_k, device=k.device).view(1, -1)
                 
-                # 1. 距离掩码 (Distance Mask): 当前 Query 位置减去 Key 位置必须小于窗口大小
                 dist_mask = (q_idx + offset_k - k_idx) < local_window
                 
-                # 2. 因果掩码 (Causal Mask): Key 不能看未来
                 causal_mask = k_idx <= (q_idx + offset_k)
                 
-                # 3. 最终有效区域
                 valid_mask = dist_mask & causal_mask
 
-                # 4. 构造 Float 类型的 Bias
                 local_bias = torch.zeros(1, 1, T_q, T_k, device=q.device, dtype=dtype)
-                # 将无效区域（False）填充为负无穷，在 Softmax 后变为 0
                 local_bias.masked_fill_(~valid_mask, torch.finfo(dtype).min)
 
                 if attention_bias is not None:
-                    # 如果原先存在 attention_bias (如 ALiBi)，将两者相加
                     bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
                     bias_slice = self._cast_attn_bias(bias_slice, dtype)
                     attention_bias = bias_slice + local_bias
                 else:
-                    # 否则直接使用自定义的 local_bias
                     attention_bias = local_bias
             else:
-                # 走正常的 Global Attention 逻辑
                 if attention_bias is not None:
                     bias_slice = attention_bias[:, :, offset_k:offset_k + T_q, :T_k]
                     attention_bias = self._cast_attn_bias(bias_slice, dtype)
-            # =========================================================
 
-            # 调用底层的 SDPA / FlashAttention
             att = self._scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attention_bias,
                 dropout_p=self.config.attention_dropout if self.training else 0.0,
-                # 【重要】如果手动构造了 attention_bias (包括上面的 local_bias)，则必须关闭 is_causal
                 is_causal=(attention_bias is None),
                 max_doc_len=max_doc_len,
                 cu_doc_lens=cu_doc_lens,
