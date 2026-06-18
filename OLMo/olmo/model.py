@@ -260,30 +260,33 @@ def _yarn_get_mscale(scale: float) -> float:
 class RotaryEmbedding(nn.Module):
     """
     [Rotary positional embeddings (RoPE)](https://arxiv.org/abs/2104.09864).
+    Supports YaRN dynamic interpolation for length extrapolation.
     """
 
     def __init__(self, config: ModelConfig, cache: BufferCache):  
         super().__init__()
         self.config = config
         self._cache = cache
+        self.base_inv_freq = self._compute_base_inv_freq(_non_meta_init_device(config))
         self.inv_freq = self.get_inv_freq(_non_meta_init_device(config))
         # Warm up cache.
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
     
-    def get_inv_freq(self, device: torch.device):
+    def _compute_base_inv_freq(self, device: torch.device) -> torch.Tensor:
         dim = self.config.d_model // self.config.n_heads
         i = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
 
-        L = self.config.max_sequence_length      # for uniform sampling frequency
-        # uniform sampling frequency
         if self.config.uniform_frequency:
-            inv_freq = 2.0 * torch.pi * i / (L)  # * dim)
+            inv_freq = 2.0 * torch.pi * i / self.config.max_sequence_length
         else:
             inv_freq = 1.0 / (self.config.rope_theta ** (i / dim))
 
-        # for fope
         if self.config.fope and not self.config.use_place_cells:
             inv_freq[inv_freq < 2 * torch.pi / self.config.max_sequence_length] = 0.0
+        return inv_freq
+
+    def get_inv_freq(self, device: torch.device):
+        inv_freq = self._compute_base_inv_freq(device)
 
         # --- YaRN integration ---
         if getattr(self.config, "yarn_enabled", False):
@@ -557,6 +560,8 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
         
         self._sigma_input = sigma
         self._layer_index = layer_index
+        self.is_learnable = getattr(config, "learnable_sigma", False)
+        self.use_scaling = True
         
         self._update_scale_factor(_non_meta_init_device(config))
 
@@ -567,6 +572,7 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
         if scaling_threshold >= 0 and self._layer_index is not None:
             if self._layer_index <= scaling_threshold:
                 use_scaling = False
+        self.use_scaling = use_scaling
 
         dim = self.config.d_model // self.config.n_heads
         
@@ -578,16 +584,23 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
                 self.register_buffer('scale_factor', scale_full)
             return 
 
+        if self.is_learnable:
+            if not hasattr(self, "sigma_param"):
+                initial_sigmas = torch.ones(self.config.n_heads, device=device) * float(self._sigma_input)
+                self.sigma_param = nn.Parameter(initial_sigmas)
+            return
+
         if isinstance(self._sigma_input, float):
             sigmas = [self._sigma_input] * self.config.n_heads
         else:
             sigmas = self._sigma_input
             
+        if len(sigmas) != self.config.n_heads:
+            raise ValueError(f"Sigma count ({len(sigmas)}) must match head count ({self.config.n_heads})")
+
         with torch.no_grad():
-            inv_freq = self.get_inv_freq(device) 
-            
             sigmas_tensor = torch.tensor(sigmas, device=device, dtype=torch.float).view(self.config.n_heads, 1)
-            freqs = inv_freq.view(1, -1) 
+            freqs = self.base_inv_freq.to(device).view(1, -1)
             
             decay_func = getattr(self.config, 'decay_func', 'gaussian')
             
@@ -614,9 +627,51 @@ class ScaledRotaryEmbedding(RotaryEmbedding):
             else:
                 self.register_buffer('scale_factor', scale_full)
 
+    def _compute_scale_from_sigmas(self, sigmas: torch.Tensor, device: torch.device) -> torch.Tensor:
+        sigmas = sigmas.view(self.config.n_heads, 1)
+        freqs = self.base_inv_freq.to(device).view(1, -1)
+        decay_func = getattr(self.config, 'decay_func', 'gaussian')
+
+        if decay_func == 'gaussian':
+            scale = torch.exp(-sigmas**2 * freqs**2 / 2) * freqs
+        elif decay_func == 'exp':
+            scale = (1 / sigmas) ** 2 / ((1 / sigmas) ** 2 + freqs**2) * freqs
+        elif decay_func == 'power':
+            scale = torch.exp(-sigmas * freqs) * freqs
+        elif decay_func == 'segmented':
+            order = getattr(self.config, 'decay_order', 8)
+            scale = (1.0 / (1.0 + (sigmas * freqs) ** order)) * freqs
+        else:
+            scale = torch.exp(-sigmas**2 * freqs**2 / 2) * freqs
+
+        scale = torch.clamp(scale, min=1e-10)
+        scale = torch.sqrt(scale)
+        scale_full = torch.cat((scale, scale), dim=-1)
+        mean_square = torch.mean(scale_full**2, dim=-1, keepdim=True)
+        mean_square = torch.clamp(mean_square, min=1e-10)
+        correction_factor = torch.rsqrt(mean_square)
+        scale_full = scale_full * correction_factor
+        scale_full = torch.nan_to_num(scale_full, nan=1.0, posinf=1.0, neginf=1.0)
+        return scale_full
+
+    def _get_scale_factor(self, device: torch.device) -> torch.Tensor:
+        dim = self.config.d_model // self.config.n_heads
+        if not self.use_scaling:
+            return torch.ones(1, self.config.n_heads, 1, dim, device=device)
+        if self.is_learnable:
+            current_sigmas = torch.clamp(self.sigma_param, min=1e-3).to(device)
+            scale_full = self._compute_scale_from_sigmas(current_sigmas, device)
+            return scale_full.view(1, self.config.n_heads, 1, -1)
+        return self.scale_factor.view(1, self.config.n_heads, 1, dim).to(device)
+
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        t_scaled = t * self.scale_factor.view(1, self.config.n_heads, 1, -1)
+        t_scaled = t * self._get_scale_factor(t.device)
         return super().apply_rotary_pos_emb(pos_sin, pos_cos, t_scaled)
+
+    def get_sigma_values(self) -> Optional[torch.Tensor]:
+        if self.is_learnable:
+            return torch.clamp(self.sigma_param.detach(), min=1e-3)
+        return None
 
 
 class ScaledRotaryEmbedding1(RotaryEmbedding):

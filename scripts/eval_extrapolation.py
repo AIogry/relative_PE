@@ -9,6 +9,7 @@ from torch.amp import autocast
 from OLMo.olmo.config import TrainConfig
 from OLMo.olmo.model import OLMo
 from OLMo.olmo.tokenizer import Tokenizer
+from transformers import AutoTokenizer
 
 def evaluate_on_length(model, tokenizer, dataset, eval_len, device, num_samples=30):
     model.eval()
@@ -62,6 +63,7 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Optional local tokenizer path")
     parser.add_argument("--lengths", nargs='+', type=int, default=[2048, 4096, 8192])
 
     parser.add_argument("--force_scaled_rope", action="store_true")
@@ -90,7 +92,13 @@ def main():
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
 
-    tokenizer = Tokenizer.from_pretrained("allenai/olmo-1b")
+    if args.tokenizer_path:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, local_files_only=True)
+        except Exception:
+            tokenizer = Tokenizer.from_pretrained(args.tokenizer_path)
+    else:
+        tokenizer = Tokenizer.from_pretrained("allenai/olmo-1b")
     val_data = load_from_disk(args.data_path)
 
     print("-" * 40)

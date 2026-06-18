@@ -394,6 +394,11 @@ class ModelConfig(BaseConfig):
     from which layer set sigma
     """
 
+    learnable_sigma: bool = False
+    """
+    If ``True``, the sigma value in Scaled RoPE becomes a learnable parameter.
+    """
+
     local_window_size: int = 256
     """
     local attention window size

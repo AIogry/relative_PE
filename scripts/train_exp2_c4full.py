@@ -92,6 +92,9 @@ def main():
     
     parser.add_argument("--model_size", type=str, default="20M", choices=["20M", "60M", "300M"])
 
+    # === local/global attention 参数 ===
+    parser.add_argument("--local_window_size", type=int, default=-1, help="Local attention window size")
+    parser.add_argument("--num_local_layers", type=int, default=0, help="Number of layers using local attention")
 
     parser.add_argument("--alibi", action="store_true")
     parser.add_argument("--fope", action="store_true")
@@ -104,6 +107,7 @@ def main():
     parser.add_argument("--sigma", type=float, default=1.0)
     parser.add_argument("--rope_scaling_threshold", type=int, default=-1)
     parser.add_argument("--sigma_list", nargs='+', default=None)
+    parser.add_argument("--learnable_sigma", action="store_true", help="Enable learnable sigma for HIPE")
     
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--global_batch_size", type=int, default=64)
@@ -117,6 +121,7 @@ def main():
     
     parser.add_argument("--wandb_mode", type=str, default="offline", help="Wandb mode")
     parser.add_argument("--wandb_dir", type=str, default=None, help="Wandb offline tracking directory")
+    parser.add_argument("--num_proc", type=int, default=8, help="Processes for dataset preprocessing")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -138,6 +143,8 @@ def main():
         run_group = "Exp2-C4-HIPE"
         run_tags.append("hipe")
         run_tags.append(f"sigma_{args.sigma}")
+        if args.learnable_sigma:
+            run_tags.append("learnable_sigma")
 
     if args.wandb_dir is not None:
         os.makedirs(args.wandb_dir, exist_ok=True)
@@ -198,8 +205,8 @@ def main():
     train_cols = train_ds.column_names
     val_cols = val_ds.column_names
 
-    tokenized_train = train_ds.map(tokenize_function, batched=True, remove_columns=train_cols, num_proc=8, desc="Tokenizing Train")
-    tokenized_val = val_ds.map(tokenize_function, batched=True, remove_columns=val_cols, num_proc=8, desc="Tokenizing Val")
+    tokenized_train = train_ds.map(tokenize_function, batched=True, remove_columns=train_cols, num_proc=args.num_proc, desc="Tokenizing Train")
+    tokenized_val = val_ds.map(tokenize_function, batched=True, remove_columns=val_cols, num_proc=args.num_proc, desc="Tokenizing Val")
 
     block_size = args.seq_len + 1
 
@@ -213,8 +220,8 @@ def main():
             for k, t in concatenated_examples.items()
         }
 
-    lm_train = tokenized_train.map(group_texts, batched=True, num_proc=8, desc="Grouping Train")
-    lm_val = tokenized_val.map(group_texts, batched=True, num_proc=8, desc="Grouping Val")
+    lm_train = tokenized_train.map(group_texts, batched=True, num_proc=args.num_proc, desc="Grouping Train")
+    lm_val = tokenized_val.map(group_texts, batched=True, num_proc=args.num_proc, desc="Grouping Val")
 
     def collate_fn(batch):
         input_ids = [item['input_ids'] for item in batch]
@@ -258,6 +265,10 @@ def main():
     
     use_flash_attention = True
 
+    if args.local_window_size > 0:
+        use_flash_attention = False
+        print(f">>> [Config] Local Attention ENABLED | Window: {args.local_window_size} | FlashAttention DISABLED")
+
     if args.alibi:
         use_alibi = True
         use_rope = False 
@@ -300,7 +311,10 @@ def main():
         scaled_rope_sigma=args.sigma,
         scaled_rope_sigmas=final_sigmas,
         rope_scaling_threshold=args.rope_scaling_threshold,
-        flash_attention=use_flash_attention
+        learnable_sigma=args.learnable_sigma,
+        flash_attention=use_flash_attention,
+        local_window_size=args.local_window_size,
+        num_local_layers=args.num_local_layers
     )
 
     if rope_scaling_config is not None:
@@ -380,6 +394,14 @@ def main():
             ppl = math.exp(avg_loss) if avg_loss < 20 else 1e9
             lr = scheduler.get_last_lr()[0]
             print(f"Step {step}/{total_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.4f} | LR: {lr:.2e}")
+
+            if args.learnable_sigma and args.use_scaled_rope:
+                sigma_values = []
+                for name, param in model.named_parameters():
+                    if "sigma" in name:
+                        sigma_values.extend(param.detach().cpu().numpy().tolist())
+                if sigma_values:
+                    wandb.log({"train/avg_sigma": sum(sigma_values) / len(sigma_values), "step": step})
 
             wandb.log({
                 "train/loss": avg_loss,
