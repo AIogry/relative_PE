@@ -90,7 +90,7 @@ def main():
 
     parser.add_argument("--model_size", type=str, default="20M", choices=["20M", "60M", "300M"])
 
-    # === local/global attention 参数 ===
+    # Local/global attention parameters.
     parser.add_argument("--local_window_size", type=int, default=-1, help="Local attention window size")
     parser.add_argument("--num_local_layers", type=int, default=0, help="Number of layers using local attention")
 

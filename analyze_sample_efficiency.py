@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-分析 Sample Efficiency 的脚本
-对比不同模型（RoPE vs HIPE）在不同数据量下达到特定准确率所需的样本数/步数
+Analyze sample-efficiency results for SST-2 experiments.
 """
 
 import json
@@ -14,13 +13,12 @@ import numpy as np
 
 
 def load_results(result_dir: str) -> Dict:
-    """加载实验结果"""
+    """Load experiment results from a result directory."""
     results = {
         "rope": {},
         "hipe": {}
     }
     
-    # 遍历所有结果目录
     for model_type in ["base", "hipe"]:
         model_key = "rope" if model_type == "base" else "hipe"
         pattern = os.path.join(result_dir, model_type, "*", "*", "*", "final_results.json")
@@ -30,8 +28,7 @@ def load_results(result_dir: str) -> Dict:
                 with open(result_file, 'r') as f:
                     data = json.load(f)
                 
-                # 解析路径获取实验设置
-                # 格式: .../base/512/lora8/shot100/seed_6198/final_results.json
+                # Expected format: .../base/512/lora8/shot100/seed_6198/final_results.json
                 parts = result_file.split(os.sep)
                 
                 seq_len = parts[-6]  # 512 or 2048
@@ -61,7 +58,7 @@ def load_results(result_dir: str) -> Dict:
 
 
 def analyze_threshold_reached(results: Dict, threshold: float = 0.80) -> pd.DataFrame:
-    """分析达到特定阈值的样本数"""
+    """Analyze the steps and samples required to reach a target threshold."""
     import pandas as pd
     
     rows = []
@@ -94,17 +91,15 @@ def analyze_threshold_reached(results: Dict, threshold: float = 0.80) -> pd.Data
 
 
 def plot_sample_efficiency(df: pd.DataFrame, output_dir: str = "."):
-    """绘制 sample efficiency 对比图"""
+    """Plot sample-efficiency comparisons."""
     if df.empty:
         print("No data to plot")
         return
     
-    # 按 shot 分组
     shots = sorted(df["shot"].unique())
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # 图1: 达到阈值所需的步数
     ax1 = axes[0]
     for model in ["ROPE", "HIPE"]:
         model_data = df[df["model"] == model]
@@ -118,7 +113,6 @@ def plot_sample_efficiency(df: pd.DataFrame, output_dir: str = "."):
     ax1.grid(True, alpha=0.3)
     ax1.set_xscale('log')
     
-    # 图2: 达到阈值所需的样本数
     ax2 = axes[1]
     for model in ["ROPE", "HIPE"]:
         model_data = df[df["model"] == model]
@@ -140,14 +134,13 @@ def plot_sample_efficiency(df: pd.DataFrame, output_dir: str = "."):
 
 
 def generate_report(results: Dict, output_dir: str = "."):
-    """生成对比报告"""
+    """Generate a text report summarizing sample-efficiency results."""
     report_lines = []
     report_lines.append("=" * 80)
     report_lines.append("SST-2 Fine-tuning Sample Efficiency Report")
     report_lines.append("=" * 80)
     report_lines.append("")
     
-    # 按 shot 和模型类型组织数据
     for shot in sorted(set([int(k.split("_")[1]) for k in list(results["rope"].keys()) + list(results["hipe"].keys())])):
         report_lines.append(f"\n{'='*80}")
         report_lines.append(f"Shot Setting: {shot if shot > 0 else 'full'}")
@@ -159,13 +152,12 @@ def generate_report(results: Dict, output_dir: str = "."):
             
             for model_type in ["rope", "hipe"]:
                 if key in results[model_type]:
-                    exp = results[model_type][key][0]  # 取第一个seed的结果
+                    exp = results[model_type][key][0]
                     
                     report_lines.append(f"\n{model_type.upper()}:")
                     report_lines.append(f"  Final Accuracy: {exp['accuracy']:.4f}")
                     report_lines.append(f"  Total Samples Processed: {exp['total_samples']:,}")
                     
-                    # Sample Efficiency
                     se_data = exp.get("sample_efficiency", {})
                     if se_data and "results" in se_data:
                         report_lines.append("  Sample Efficiency:")
@@ -182,7 +174,6 @@ def generate_report(results: Dict, output_dir: str = "."):
     
     report_lines.append("\n" + "=" * 80)
     
-    # 保存报告
     report_text = "\n".join(report_lines)
     report_path = os.path.join(output_dir, "sample_efficiency_report.txt")
     with open(report_path, 'w') as f:
@@ -204,17 +195,13 @@ def main():
     
     args = parser.parse_args()
     
-    # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 加载结果
     print(f"Loading results from {args.result_dir}...")
     results = load_results(args.result_dir)
     
-    # 生成报告
     generate_report(results, args.output_dir)
     
-    # 分析特定阈值
     try:
         import pandas as pd
         df = analyze_threshold_reached(results, args.threshold)
@@ -224,7 +211,6 @@ def main():
             print(f"{'='*80}")
             print(df.to_string(index=False))
             
-            # 绘图
             plot_sample_efficiency(df, args.output_dir)
     except ImportError:
         print("\nNote: pandas/matplotlib not available, skipping DataFrame analysis and plotting")

@@ -1,9 +1,9 @@
 """
 SST-2 (Stanford Sentiment Treebank) Fine-tuning Script for OLMo with HIPE
-支持 LoRA 微调和 Few-shot 学习
+Supports LoRA fine-tuning and few-shot experiments.
 
 Usage:
-    # Full fine-tuning on SST-2 with LoRA (推荐)
+    # Full fine-tuning on SST-2 with LoRA
     python finetune_sst2.py \
         --base_model_path checkpoints/c4_300M/model.pt \
         --output_dir results/sst2_hipe \
@@ -47,7 +47,7 @@ from OLMo.olmo.model import OLMo
 
 
 def set_seed(seed: int):
-    """设置随机种子保证可复现性"""
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -58,7 +58,7 @@ def set_seed(seed: int):
 
 
 def get_git_info() -> Dict[str, str]:
-    """获取当前代码仓库的Git信息"""
+    """Collect Git metadata for the current repository."""
     git_info = {}
     try:
         git_info["commit_hash"] = subprocess.check_output(
@@ -84,7 +84,7 @@ def get_git_info() -> Dict[str, str]:
 
 class LoRALayer(nn.Module):
     """
-    LoRA (Low-Rank Adaptation) 层实现
+    LoRA (Low-Rank Adaptation) layer.
     """
     def __init__(self, in_features: int, out_features: int, rank: int = 8, lora_alpha: float = 16):
         super().__init__()
@@ -92,11 +92,9 @@ class LoRALayer(nn.Module):
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / rank
         
-        # LoRA 可训练参数
         self.lora_A = nn.Parameter(torch.zeros(in_features, rank))
         self.lora_B = nn.Parameter(torch.zeros(rank, out_features))
         
-        # 初始化: A 用高斯, B 用零
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
     
@@ -107,8 +105,7 @@ class LoRALayer(nn.Module):
 
 class OLMoForSequenceClassification(nn.Module):
     """
-    OLMo + 分类头，用于SST-2等文本分类任务
-    支持 LoRA 微调
+    OLMo with a classification head for SST-2 and related text classification tasks.
     """
     def __init__(
         self, 
@@ -125,44 +122,35 @@ class OLMoForSequenceClassification(nn.Module):
         self.num_labels = num_labels
         self.lora_rank = lora_rank
         
-        # 加载基础 OLMo 模型
         self.olmo = OLMo(config)
         
-        # 分类头
         self.classifier = nn.Linear(config.d_model, num_labels)
         
-        # 初始化分类头 - 使用更保守的初始化
         nn.init.normal_(self.classifier.weight, std=0.01)
         nn.init.zeros_(self.classifier.bias)
         
-        # 设置参数冻结策略
         self._setup_parameter_freezing(freeze_base_model, freeze_sigma)
         
-        # 设置 LoRA
         if lora_rank > 0:
-            # OLMo结构: transformer.blocks.{i}.att_proj (QKV合并) 和 attn_out
             target_modules = lora_target_modules or ["att_proj", "attn_out", "ff_proj", "ff_out"]
             self._setup_lora(lora_rank, lora_alpha, target_modules)
     
     def _setup_parameter_freezing(self, freeze_base_model: bool, freeze_sigma: bool):
-        """设置参数冻结策略 - 基础模型参数默认冻结"""
+        """Configure parameter freezing. Base-model weights are frozen by default."""
         if freeze_base_model:
             for name, param in self.olmo.named_parameters():
                 param.requires_grad = False
         
-        # 分类头始终可训练
         for param in self.classifier.parameters():
             param.requires_grad = True
     
     def setup_learnable_sigma(self, freeze_sigma: bool = False):
         """
-        在加载预训练权重后调用，解冻实际存在的sigma参数
-        注意：rope_scaling_threshold 已在创建模型时正确设置
+        Unfreeze sigma parameters that still exist after loading pretrained weights.
         """
         if freeze_sigma:
             return
         
-        # 解冻实际存在的sigma参数
         sigma_count = 0
         for name, param in self.olmo.named_parameters():
             if "sigma" in name and param is not None:
@@ -176,7 +164,7 @@ class OLMoForSequenceClassification(nn.Module):
             print("[Sigma] No sigma parameters found in model (using fixed RoPE)")
     
     def _setup_lora(self, rank: int, alpha: float, target_modules: List[str]):
-        """为指定模块添加 LoRA"""
+        """Attach LoRA adapters to matching modules."""
         self.lora_layers = nn.ModuleDict()
         lora_count = 0
         
@@ -227,7 +215,7 @@ class OLMoForSequenceClassification(nn.Module):
         return logits, loss
     
     def get_trainable_parameters(self) -> Dict[str, int]:
-        """获取可训练参数的统计信息"""
+        """Return trainable-parameter statistics."""
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
@@ -250,15 +238,14 @@ class OLMoForSequenceClassification(nn.Module):
 
 def load_sst2_dataset(tokenizer, max_length: int = 128, few_shot: int = -1, local_path: str = None):
     """
-    加载 SST-2 数据集
-    
-    SST-2是二分类情感分析任务：
-    - 0: Negative (负面)
-    - 1: Positive (正面)
+    Load SST-2.
+
+    SST-2 is a balanced binary sentiment task:
+    - 0: Negative
+    - 1: Positive
     """
     import os
     
-    # 加载数据集
     if local_path and os.path.exists(local_path):
         print(f"Loading SST-2 from local path: {local_path}")
         dataset = {
@@ -274,13 +261,12 @@ def load_sst2_dataset(tokenizer, max_length: int = 128, few_shot: int = -1, loca
             print("Loading SST-2 from HuggingFace...")
         dataset = load_dataset("glue", "sst2")
     
-    # 确保tokenizer有pad_token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         print(f"[Tokenizer] Set pad_token to eos_token: {tokenizer.pad_token}")
     
     def preprocess_function(examples):
-        """预处理函数"""
+        """Tokenize a batch of examples."""
         result = tokenizer(
             examples["sentence"],
             padding="max_length",
@@ -291,7 +277,6 @@ def load_sst2_dataset(tokenizer, max_length: int = 128, few_shot: int = -1, loca
         result["labels"] = examples["label"]
         return result
     
-    # 应用预处理
     print(">>> Preprocessing datasets...")
     train_dataset = dataset["train"].map(
         preprocess_function,
@@ -312,18 +297,17 @@ def load_sst2_dataset(tokenizer, max_length: int = 128, few_shot: int = -1, loca
         desc="Tokenizing test"
     )
     
-    # 转换为 PyTorch 格式
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     val_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     test_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     
-    # Few-shot 采样 - 分层采样
+    # Stratified few-shot sampling.
     if few_shot > 0 and few_shot < len(train_dataset):
         labels = np.array(train_dataset["labels"])
         indices_0 = np.where(labels == 0)[0]  # Negative
         indices_1 = np.where(labels == 1)[0]  # Positive
         
-        # SST-2分布: 约50/50
+        # SST-2 is approximately balanced.
         n_1 = int(few_shot * len(indices_1) / len(labels))
         n_0 = few_shot - n_1
         
@@ -351,9 +335,7 @@ def load_sst2_dataset(tokenizer, max_length: int = 128, few_shot: int = -1, loca
 
 def evaluate(model, dataloader, device, use_amp: bool = True) -> Dict[str, float]:
     """
-    评估模型性能
-    
-    SST-2主要指标：Accuracy (因为类别平衡)
+    Evaluate the model on SST-2.
     """
     model.eval()
     all_preds = []
@@ -381,7 +363,6 @@ def evaluate(model, dataloader, device, use_amp: bool = True) -> Dict[str, float
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     
-    # SST-2主要指标
     acc = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average='binary')
     precision = precision_score(all_labels, all_preds, average='binary', zero_division=0)
@@ -400,117 +381,103 @@ def evaluate(model, dataloader, device, use_amp: bool = True) -> Dict[str, float
 def main():
     parser = argparse.ArgumentParser(description="SST-2 Fine-tuning for OLMo with HIPE")
     
-    # 模型参数
     parser.add_argument("--base_model_path", type=str, required=True,
-                        help="预训练模型路径 (.pt 文件)")
+                        help="Path to the pretrained model checkpoint (.pt)")
     parser.add_argument("--model_size", type=str, default="300M", 
                         choices=["20M", "60M", "300M"])
     parser.add_argument("--local_tokenizer_path", type=str, 
                         default="./wikitext/tokenizer",
-                        help="分词器路径")
+                        help="Tokenizer path")
     
-    # HIPE 参数
     parser.add_argument("--use_scaled_rope", action="store_true",
-                        help="使用 HIPE (ScaledRoPE)")
+                        help="Enable HIPE (ScaledRoPE)")
     parser.add_argument("--sigma", type=float, default=200.0,
-                        help="HIPE sigma 初始值")
+                        help="Initial HIPE sigma value")
     parser.add_argument("--learnable_sigma", action="store_true",
-                        help="sigma 是否可学习")
+                        help="Make sigma trainable")
     parser.add_argument("--rope_scaling_threshold", type=int, default=-1,
-                        help="分层阈值，-1 表示全局使用")
+                        help="Layer threshold for hierarchical scaling; -1 means global")
     parser.add_argument("--decay_func", type=str, default="gaussian",
                         choices=["gaussian", "exp", "power", "segmented"],
-                        help="衰减函数类型")
+                        help="Decay function type")
     
-    # LoRA 参数
     parser.add_argument("--use_lora", action="store_true",
-                        help="是否使用 LoRA (强烈推荐)")
+                        help="Enable LoRA")
     parser.add_argument("--lora_rank", type=int, default=8,
-                        help="LoRA 秩")
+                        help="LoRA rank")
     parser.add_argument("--lora_alpha", type=float, default=16,
-                        help="LoRA alpha 缩放因子")
+                        help="LoRA alpha scaling factor")
     parser.add_argument("--lora_target", nargs="+", 
                         default=["att_proj", "attn_out", "ff_proj", "ff_out"],
-                        help="LoRA 目标模块 (OLMo使用: att_proj, attn_out, ff_proj, ff_out)")
+                        help="LoRA target modules (for OLMo: att_proj, attn_out, ff_proj, ff_out)")
     
-    # 微调策略
     parser.add_argument("--freeze_base", action="store_true", default=True,
-                        help="冻结基础模型权重")
+                        help="Freeze base-model weights")
     parser.add_argument("--freeze_sigma", action="store_true", default=False,
-                        help="冻结 sigma 参数")
+                        help="Freeze sigma parameters")
     parser.add_argument("--sigma_lr", type=float, default=None,
-                        help="sigma 参数的专用学习率")
+                        help="Dedicated learning rate for sigma parameters")
     
-    # 数据参数
     parser.add_argument("--sst2_data_path", type=str, default=None,
-                        help="SST-2 数据集本地路径")
+                        help="Local SST-2 dataset path")
     parser.add_argument("--few_shot", type=int, default=-1,
-                        help="Few-shot 样本数，-1 表示使用全部数据")
+                        help="Few-shot sample count; -1 uses the full training set")
     parser.add_argument("--max_length", type=int, default=128,
-                        help="最大序列长度")
+                        help="Maximum sequence length")
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     
-    # 训练参数
     parser.add_argument("--num_epochs", type=int, default=5,
-                        help="SST-2通常5个epoch足够")
+                        help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=5e-4,
-                        help="学习率")
+                        help="Learning rate")
     parser.add_argument("--classifier_lr", type=float, default=None,
-                        help="分类头专用学习率")
+                        help="Dedicated learning rate for the classifier head")
     parser.add_argument("--lora_lr", type=float, default=None,
-                        help="LoRA专用学习率")
+                        help="Dedicated learning rate for LoRA parameters")
     parser.add_argument("--weight_decay", type=float, default=0.1,
-                        help="权重衰减")
+                        help="Weight decay")
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
-                        help="梯度累积步数")
+                        help="Gradient accumulation steps")
     
     # Early stopping
     parser.add_argument("--early_stopping_patience", type=int, default=5,
-                        help="早停耐心值 (按eval次数)")
+                        help="Early stopping patience measured in evaluation events")
     parser.add_argument("--early_stopping_delta", type=float, default=0.001,
-                        help="早停最小改善阈值")
+                        help="Minimum improvement required to reset early stopping")
     
-    # 输出参数
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--eval_interval", type=int, default=100,
-                        help="每隔多少 step 评估一次 (与eval_interval_samples二选一)")
+                        help="Evaluate every N optimizer steps")
     parser.add_argument("--eval_interval_samples", type=int, default=None,
-                        help="每隔多少样本评估一次 (如1000表示每处理1000个样本评估)")
+                        help="Evaluate every N processed samples")
     parser.add_argument("--save_interval", type=int, default=500,
-                        help="每隔多少 step 保存 checkpoint")
+                        help="Save a checkpoint every N optimizer steps")
     
-    # wandb 参数
     parser.add_argument("--wandb_mode", type=str, default="offline",
                         choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_project", type=str, default="HIPE-SST2")
     parser.add_argument("--wandb_dir", type=str, default=None,
-                        help="WandB 日志目录")
+                        help="WandB logging directory")
     
     args = parser.parse_args()
     
-    # 设置随机种子
     set_seed(args.seed)
     
-    # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 保存配置
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
     
-    # 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Git 信息
     git_info = get_git_info()
     
-    # 初始化 wandb
     run_name = args.run_name or f"sst2_{args.model_size}_{'hipe' if args.use_scaled_rope else 'rope'}"
     if args.few_shot > 0:
         run_name += f"_shot{args.few_shot}"
@@ -528,7 +495,6 @@ def main():
         dir=args.wandb_dir if args.wandb_dir else args.output_dir,
     )
     
-    # 加载分词器
     print(f"Loading tokenizer from {args.local_tokenizer_path}...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.local_tokenizer_path, local_files_only=True)
@@ -536,7 +502,6 @@ def main():
         from OLMo.olmo.tokenizer import Tokenizer
         tokenizer = Tokenizer.from_pretrained(args.local_tokenizer_path)
     
-    # 加载 SST-2 数据
     print("Loading SST-2 dataset...")
     train_dataset, val_dataset, test_dataset = load_sst2_dataset(
         tokenizer, 
@@ -550,7 +515,6 @@ def main():
     
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     
-    # 模型配置
     print("Building model...")
     if args.model_size == "20M":
         cur_d, cur_h, cur_l, cur_mlp = 256, 8, 8, 8
@@ -579,7 +543,7 @@ def main():
         use_scaled_rope1=args.use_scaled_rope,
         scaled_rope_sigma=args.sigma,
         rope_scaling_threshold=args.rope_scaling_threshold,
-        learnable_sigma=args.learnable_sigma,  # 创建时启用，但加载后会删除多余的sigma
+        learnable_sigma=args.learnable_sigma,
         decay_func=args.decay_func,
         flash_attention=use_flash_attn,
         include_bias=False,
@@ -588,7 +552,6 @@ def main():
         embedding_dropout=0.0,
     )
     
-    # 构建模型
     model = OLMoForSequenceClassification(
         config=cfg,
         num_labels=2,
@@ -599,7 +562,6 @@ def main():
         freeze_sigma=args.freeze_sigma,
     )
     
-    # 加载预训练权重
     if args.base_model_path and os.path.exists(args.base_model_path):
         print(f"Loading pretrained weights from {args.base_model_path}...")
         try:
@@ -607,7 +569,6 @@ def main():
             model.olmo.load_state_dict(state_dict, strict=False)
             print("✓ Pretrained weights loaded successfully.")
             
-            # 关键：加载权重后，根据实际存在的sigma参数设置可学习性
             if args.learnable_sigma and not args.freeze_sigma:
                 print(">>> Setting up learnable sigma parameters...")
                 model.setup_learnable_sigma(freeze_sigma=False)
@@ -617,7 +578,6 @@ def main():
     
     model = model.to(device)
     
-    # 打印可训练参数信息
     param_stats = model.get_trainable_parameters()
     print(f"\nParameter Statistics:")
     print(f"  Total: {param_stats['total']:,}")
@@ -629,10 +589,8 @@ def main():
     
     wandb.config.update(param_stats, allow_val_change=True)
     
-    # 优化器设置
     param_groups = []
     
-    # 分类头参数
     classifier_lr = args.classifier_lr or args.lr
     classifier_params = list(model.classifier.parameters())
     if classifier_params:
@@ -643,7 +601,6 @@ def main():
         })
         print(f"Classifier learning rate: {classifier_lr}")
     
-    # LoRA 参数
     if args.use_lora and hasattr(model, 'lora_layers'):
         lora_lr = args.lora_lr or args.lr
         lora_params = list(model.lora_layers.parameters())
@@ -655,7 +612,6 @@ def main():
             })
             print(f"LoRA learning rate: {lora_lr}")
     
-    # Sigma 参数
     sigma_params = [p for n, p in model.named_parameters() if "sigma" in n and p.requires_grad]
     if sigma_params:
         sigma_lr = args.sigma_lr or args.lr
@@ -672,7 +628,6 @@ def main():
         betas=(0.9, 0.999),
     )
     
-    # 学习率调度
     total_steps = len(train_loader) * args.num_epochs // args.gradient_accumulation_steps
     warmup_steps = int(total_steps * args.warmup_ratio)
     
@@ -687,38 +642,31 @@ def main():
     print(f"Total steps (with grad accum): {total_steps}")
     print(f"Warmup steps: {warmup_steps}")
     
-    # 训练循环
     global_step = 0
-    best_acc = 0.0  # SST-2用accuracy作为主要指标
+    best_acc = 0.0
     best_checkpoint_path = None
     evals_without_improvement = 0
     
-    # Sample Efficiency Tracking: 记录达到特定准确率所需的步数和样本数
-    # 根据shot设置动态调整目标阈值
+    # Adjust sample-efficiency thresholds by few-shot regime.
     if args.few_shot > 0 and args.few_shot <= 10:
-        # 超少样本 (1, 5, 10): 从随机水平开始记录 (SST-2平衡数据集随机~50%)
         acc_thresholds = [0.50, 0.55, 0.60, 0.65, 0.70]
     elif args.few_shot > 10 and args.few_shot <= 50:
-        # 极少样本 (50): 稍微提高目标
         acc_thresholds = [0.55, 0.60, 0.65, 0.70, 0.75]
     elif args.few_shot > 50 and args.few_shot < 1000:
-        # 小样本 (100-500): 标准小样本目标
         acc_thresholds = [0.60, 0.65, 0.70, 0.75]
     elif args.few_shot >= 1000 and args.few_shot < 5000:
         acc_thresholds = [0.70, 0.75, 0.80]
     elif args.few_shot >= 5000:
-        # 大样本 (5000, 10000)
         acc_thresholds = [0.75, 0.80, 0.85]
     else:
-        # full数据集：从50%开始记录，更全面地追踪收敛过程
         acc_thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
     
     sample_efficiency = {
         "thresholds": acc_thresholds,
-        "results": {}  # {threshold: {"step": int, "samples": int, "epoch": float}}
+        "results": {}
     }
-    samples_processed = 0  # 已处理的样本数
-    last_eval_samples = 0  # 上次评估时的样本数（用于基于样本的评估间隔）
+    samples_processed = 0
+    last_eval_samples = 0
     
     log_file = open(os.path.join(args.output_dir, "training_log.txt"), "w")
     log_file.write("step,epoch,train_loss,eval_acc,eval_f1,learning_rate,samples_processed\n")
@@ -736,11 +684,9 @@ def main():
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             
-            # 统计样本数
             batch_size_actual = input_ids.size(0)
             samples_processed += batch_size_actual
             
-            # 前向
             if use_flash_attn:
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                     logits, loss = model(input_ids, attention_mask, labels)
@@ -777,18 +723,14 @@ def main():
                 
                 accumulated_loss = 0.0
                 
-                # 评估条件：基于step或基于样本数
                 should_eval = False
                 if args.eval_interval_samples is not None:
-                    # 基于样本数的评估
                     if samples_processed - last_eval_samples >= args.eval_interval_samples:
                         should_eval = True
                 else:
-                    # 基于step的评估
                     if global_step % args.eval_interval == 0:
                         should_eval = True
                 
-                # 评估
                 if should_eval:
                     eval_results = evaluate(model, val_loader, device, use_amp=use_flash_attn)
                     
@@ -806,7 +748,6 @@ def main():
                     log_file.write(f"{global_step},{epoch+1},{accumulated_loss},{eval_results['accuracy']:.4f},{eval_results['f1']:.4f},{scheduler.get_last_lr()[0]:.6f},{samples_processed}\n")
                     log_file.flush()
                     
-                    # Sample Efficiency Tracking: 检查是否达到新的阈值
                     current_acc = eval_results["accuracy"]
                     for threshold in acc_thresholds:
                         thresh_str = f"{threshold:.2f}"
@@ -820,7 +761,6 @@ def main():
                                 }
                                 print(f"  -> [Sample Efficiency] Reached {threshold*100:.0f}% accuracy at step {global_step} ({samples_processed} samples)")
                     
-                    # 保存最佳模型 (基于accuracy)
                     if current_acc > best_acc + args.early_stopping_delta:
                         best_acc = current_acc
                         best_checkpoint_path = os.path.join(args.output_dir, "best_model.pt")
@@ -840,7 +780,6 @@ def main():
                         evals_without_improvement += 1
                         print(f"  -> No improvement ({evals_without_improvement}/{args.early_stopping_patience})")
                     
-                    # 更新上次评估的样本数（用于基于样本的评估间隔）
                     if args.eval_interval_samples is not None:
                         last_eval_samples = samples_processed
                     
@@ -857,7 +796,6 @@ def main():
         if evals_without_improvement >= args.early_stopping_patience:
             break
     
-    # 最终评估
     print("\n" + "="*50)
     print("Final Evaluation")
     print("="*50)
@@ -873,8 +811,7 @@ def main():
     print(f"Precision: {final_results['precision']:.4f}")
     print(f"Recall: {final_results['recall']:.4f}")
     
-    # 保存最终结果
-    # 补充未达到的阈值信息
+    # Fill in thresholds that were never reached.
     for threshold in acc_thresholds:
         thresh_str = f"{threshold:.2f}"
         if thresh_str not in sample_efficiency["results"]:
@@ -895,12 +832,11 @@ def main():
             "best_val_loss": final_results['loss'],
             "trainable_params": param_stats['trainable'],
             "trainable_pct": param_stats['trainable_pct'],
-            "sample_efficiency": sample_efficiency,  # 新增：样本效率指标
-            "total_samples_processed": samples_processed,  # 总处理样本数
+            "sample_efficiency": sample_efficiency,
+            "total_samples_processed": samples_processed,
             "args": vars(args),
         }, f, indent=2)
     
-    # 打印 Sample Efficiency 摘要
     print("\n" + "="*50)
     print("Sample Efficiency Summary")
     print("="*50)

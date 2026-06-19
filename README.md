@@ -76,7 +76,7 @@ WikiText-103:
 
 ```bash
 MODEL_SIZE=60M SEQ_LEN=1024 \
-EXTRA_ARGS="--use_scaled_rope --sigma 100.0 --rope_scaling_threshold 3" \
+EXTRA_ARGS="--use_scaled_rope --sigma 500.0 --rope_scaling_threshold 3" \
 bash scripts/release/run_exp2_wikitext.sh
 ```
 
@@ -84,7 +84,7 @@ C4:
 
 ```bash
 MODEL_SIZE=60M SEQ_LEN=1024 \
-EXTRA_ARGS="--use_scaled_rope --sigma 100.0 --rope_scaling_threshold 3" \
+EXTRA_ARGS="--use_scaled_rope --sigma 500.0 --rope_scaling_threshold 3" \
 bash scripts/release/run_exp2_c4_restricted.sh
 ```
 
@@ -151,3 +151,11 @@ This is the recommended path for reproducing the local/global attention compatib
 ## Citation
 
 If you use this repository, please cite the ICML 2026 paper.
+
+```bibtex
+@inproceedings{zhou2026hippocampal,
+  title     = {The Hippocampal Place Field Gradient: A Bio-inspired Framework Building Multiscale Representation for Better Sample Efficiency},
+  author    = {Shujun Zhou and Junrong Qi and Guozhang Chen},
+  booktitle = {Proceedings of the International Conference on Machine Learning},
+  year      = {2026}
+}

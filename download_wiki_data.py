@@ -13,7 +13,7 @@ def download_and_save(base_dir: str, tokenizer_name: str):
     print(f">>> 1. Downloading WikiText-103 Dataset to {local_data_dir}...")
     
     try:
-        # === [关键修改] 使用 wikitext-103-v1，这是纯数据格式，不会报错 ===
+        # Use the raw WikiText-103 dataset variant for a straightforward download flow.
         dataset = load_dataset("wikitext", "wikitext-103-v1")
         dataset.save_to_disk(local_data_dir)
         print(f">>> Success! Dataset saved to: {local_data_dir}")
